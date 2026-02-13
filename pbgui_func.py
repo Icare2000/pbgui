@@ -228,14 +228,6 @@ def build_navigation():
     pSe2 = st.Page(paths["INFO_COIN_DATA"], title="Coin Data", icon=":material/monetization_on:")
     pH1 = st.Page(paths["HELP"], title="Help", icon=":material/help:", url_path="help")
 
-    pS1 = st.Page(paths["V6_SINGLE_RUN"], title="Run", icon=":material/play_arrow:")
-    pS2 = st.Page(paths["V6_SINGLE_BACKTEST"], title="Backtest", icon=":material/history:")
-    pS3 = st.Page(paths["V6_SINGLE_OPTIMIZE"], title="Optimize", icon=":material/tune:")
-    pS4 = st.Page(paths["V6_SPOT_VIEW"], title="Spot View", icon=":material/remove_red_eye:")
-
-    p61 = st.Page(paths["V6_MULTI_RUN"], title="Run", icon=":material/play_arrow:")
-    p62 = st.Page(paths["V6_MULTI_BACKTEST"], title="Backtest", icon=":material/history:")
-    p63 = st.Page(paths["V6_MULTI_OPTIMIZE"], title="Optimize", icon=":material/tune:")
 
     p71 = st.Page(paths["V7_RUN"], title="Run", icon=":material/play_arrow:")
     p72 = st.Page(paths["V7_BACKTEST"], title="Backtest", icon=":material/history:")
@@ -252,17 +244,12 @@ def build_navigation():
                 
     InfotmationPages = [pSe1, pSe2, pH1]
     v7Pages = [p71, p72, p77, p73, p74, p75, p76]
-    v6Pages = [p61, p62, p63]
-    SinglePages = [pS1, pS2, pS3, pS4]
-
     # Navigation
     navi = st.navigation(
         {
             "System": SystemPages,
             "Information": InfotmationPages,
             "PBv7": v7Pages,
-            "PBv6 Multi": v6Pages,
-            "PBv6 Single": SinglePages,
         },position="top"
     )
     st.session_state.navigation = navi
