@@ -267,6 +267,58 @@ pbmon = """
     Run "crontab -e" and add the @reboot with your path
     ```"""
 
+vps_settings = """
+    ```
+    VPS Settings configures monitoring for your VPS servers.
+    The VPS monitoring runs inside the API Server — no separate daemon needed.
+    It maintains persistent SSH connections (asyncssh), monitors services
+    (PBRun, PBRemote, PBCoinData), auto-restarts them on failure,
+    and sends Telegram alerts on connection loss or service issues.
+
+    Requirements:
+    - SSH keys must be installed on VPS (via VPS Manager)
+    - VPS must be registered in VPS Manager
+    - Telegram config (shared with PBMon) for alerts
+    - API Server must be running
+
+    Only relevant on the Master node.
+    ```"""
+
+vps_auto_restart = """
+    ```
+    When enabled, the VPS monitor will automatically restart services
+    (PBRun, PBRemote, PBCoinData) that are detected as down.
+    Rate limited to 3 restarts per service per hour.
+    ```"""
+
+vps_monitor_interval = """
+    ```
+    How often the VPS monitor checks connections and services (in seconds).
+    Default: 15 seconds. Minimum: 5 seconds.
+    ```"""
+
+vps_enabled_hosts = """
+    ```
+    Enable or disable monitoring for this VPS host.
+    Only enabled hosts will be connected via SSH and monitored.
+    Default: all hosts are disabled. Enable them individually
+    or use "Enable All" to activate all at once.
+    Changes take effect after saving (API Server picks up changes automatically).
+    ```"""
+
+vps_monitor_page = """
+    ```
+    VPS Monitor provides real-time monitoring of all VPS servers
+    via the API Server's persistent SSH connections.
+    
+    Dashboard: Live system metrics (CPU, RAM, Disk, Swap) with ~1-3s latency.
+    Instances: All bot instances across all VPS with PnL, errors, tracebacks.
+    Services: PBRun, PBRemote, PBCoinData status per VPS with restart buttons.
+    Live Logs: Real-time log streaming (tail -f) for services and bots.
+    
+    Requires API Server to be running (start from Services → API Server).
+    ```"""
+
 pbstat = """
     ```
     This is the Data Scrapper from PBGUI.
@@ -1318,6 +1370,12 @@ max_warmup_minutes = """
     Default: 0 (disabled)
     ```"""
 
+candle_interval_minutes = """
+    ```
+    Aggregate 1m candles into larger intervals for backtests. Use 1 for full resolution.
+    Example: 5 builds 5-minute candles from 1m data.
+    ```"""
+
 memory_snapshot_interval_minutes = """
     ```
     Interval between memory snapshot telemetry entries (RSS, cache footprint, 
@@ -1406,6 +1464,14 @@ coindata_metadata_interval = """
     You need 1 credit for 100 coins. So count your coins and interval to not exceed the limit.
     ```"""
 
+coindata_mapping_interval = """
+    ```
+    interval in hours to refresh CCXT market data and exchange symbol mappings.
+    This includes HIP-3 (stock perpetuals) detection on Hyperliquid.
+    Lower values give faster updates when new markets are listed,
+    but increase exchange API usage. Default: 24 hours.
+    ```"""
+
 market_orders_allowed = """
     ```
     If true, allow Passivbot to place market orders when order price is very close to current
@@ -1485,17 +1551,29 @@ max_concurrent_api_requests = """
     Set to 0 to disable (unlimited).
     ```"""
 
+enable_archive_candle_fetch = """
+    ```
+    Allow live candle fetching to use exchange archive data for missing ranges.
+    Disabled by default to avoid potential timeouts.
+    ```"""
+
+max_ohlcv_fetches_per_minute = """
+    ```
+    Maximum OHLCV fetches per minute in live mode.
+    Set lower to reduce API pressure if you hit rate limits.
+    ```"""
+
 maker_fee_override = """
     ```
     Optional maker fee override (part-per-one; use 0.0002 for 0.02%).
     Set to -1 to use exchange-derived maker fees.
     ```"""
 
-combine_ohlcvs = """
+ohlcv_source_dir = """
     ```
-    When true, build a single "combined" dataset by taking the best-quality feed
-    for each coin across all configured exchanges. When false, the
-    backtester/optimizer runs each exchange independently.
+    Optional path to a local OHLCV archive to use for backtests/optimizations.
+    Expected layout: <source_root>/<exchange>/1m/<COIN or SYMBOL>/YYYY-MM-DD.npz
+    Leave empty to use the default CandlestickManager/CCXT fetch.
     ```"""
 
 compress_cache = """
@@ -1523,6 +1601,19 @@ btc_collateral_ltv_cap = """
     Optional loan-to-value ceiling (USD debt ÷ equity) enforced when topping up BTC.
     Leave null (default) to allow unlimited debt, or set to a float (e.g., 0.6) to stop
     buying BTC once leverage exceeds that threshold.
+    ```"""
+
+market_settings_sources = """
+    ```
+    Override which exchange provides market settings (fees, min quantities, etc.) for each coin during backtest.
+    By default, each coin uses the same exchange for both price data (OHLCV) and market settings.
+    Use this to test with different fee structures or market conditions.
+    ```"""
+
+volume_normalization = """
+    ```
+    If true, normalizes volume data by dividing quoted volume by mid price to get base asset volume.
+    If false, uses quoted volume as-is (legacy behavior).
     ```"""
 
 compress_results_file = """
@@ -2172,7 +2263,7 @@ coin_sources_coin = """Coin symbol to override"""
 coin_sources_exchange = """Target exchange for this coin"""
 
 coin_sources_select_exchange = """
-    Optional mapping of coin → exchange to override automatic selection when combine_ohlcvs is true.
+    Optional mapping of coin → exchange to override automatic selection in multi-exchange backtests.
     You can choose any exchange to force this coin to use specific exchange data."""
 
 coin_sources_select_coin = """
@@ -2206,7 +2297,7 @@ compare_backtest_exchange_help = """
 
         Hyperliquid behavior:
         - If you choose 'hyperliquid' and press ▶ (Run Backtest), PBGui will force Binance candles via backtest.coin_sources.
-            PB7 requires backtest.combine_ohlcvs for coin_sources, so the backtest will be stored under the 'combined' results folder
+            The backtest will be stored under the 'combined' results folder
             (PBGui still shows it when Exchange=hyperliquid)."""
 
 backtest_start_date = """

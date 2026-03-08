@@ -141,12 +141,36 @@ class Users:
             if user.exchange == exchange:
                 return user.name
     
+    @property
+    def tradfi(self) -> dict:
+        """TradFi data provider config (alpaca, polygon, etc.) for stock perps backtesting."""
+        val = self._top_level_extras.get("tradfi", {})
+        return val if isinstance(val, dict) else {}
+
+    @tradfi.setter
+    def tradfi(self, value: dict):
+        if value:
+            self._top_level_extras["tradfi"] = value
+        else:
+            self._top_level_extras.pop("tradfi", None)
+
     def find_binance_user(self):
         for user in self.users:
             if user.exchange == "binance":
                 if user.key and user.secret:
                     if len(user.key) > 20 and len(user.secret) > 20:
                         return user
+        return None
+
+    def find_binance_users(self):
+        users = []
+        for user in self.users:
+            if user.exchange == "binance":
+                if user.key and user.secret:
+                    if len(user.key) > 20 and len(user.secret) > 20:
+                        users.append(user)
+        if users:
+            return users
         return None
 
     def find_bitget_users(self):
@@ -202,7 +226,7 @@ class Users:
             return None
 
         for user_name, user_data in users.items():
-            if user_name == "referrals" or str(user_name).startswith("_"):
+            if user_name == "referrals" or user_name == "tradfi" or str(user_name).startswith("_"):
                 self._top_level_extras[user_name] = user_data
                 continue
 
@@ -304,9 +328,3 @@ class Users:
                 shutil.copy(PurePath(self.api7_path), destination)
             with Path(f'{self.api7_path}').open("w", encoding="UTF-8") as f:
                 json.dump(save_users, f, indent=4)
-
-def main():
-    print("Don't Run this Class from CLI")
-
-if __name__ == '__main__':
-    main()

@@ -11,7 +11,7 @@ import configparser
 import time
 import multiprocessing
 import pandas as pd
-from pbgui_func import PBGDIR, pb7dir, pb7venv, validateJSON, load_symbols_from_ini, error_popup, info_popup, get_navi_paths, replace_special_chars
+from pbgui_func import PBGDIR, pb7dir, pb7venv, validateJSON, load_symbols_from_ini, error_popup, info_popup, get_navi_paths, replace_special_chars, render_log_viewer
 from pbgui_purefunc import config_pretty_str, pb7_suite_preflight_errors
 from pbgui_purefunc import load_ini, save_ini
 from PBCoinData import CoinData, normalize_symbol
@@ -25,7 +25,8 @@ import shutil
 from RunV7 import V7Instance
 import OptimizeV7
 import datetime
-import logging
+import traceback
+from logging_helpers import human_log as _log
 import os
 import fnmatch
 
@@ -61,23 +62,6 @@ class BacktestV7QueueItem():
                     f.seek(start_pos)
                     # Read the last 100 KB (or less if the file is smaller)
                     return f.read().decode('utf-8', errors='ignore')  # Decode and ignore errors
-
-    @st.fragment
-    def view_log(self):
-        col1, col2, col3 = st.columns([1,1,8], vertical_alignment="bottom")
-        with col1:
-            st.checkbox("Reverse", value=True , key=f'reverse_view_log_{self.name}', )
-        with col2:
-            st.selectbox("view last kB", [50, 100, 250, 500, 1000, 2000, 5000, 10000, 100000], key=f'size_view_log_{self.name}')
-        with col3:
-            if st.button(":material/refresh:", key=f'refresh_view_log_{self.name}'):
-                st.rerun(scope="fragment")
-        logfile = self.load_log(st.session_state[f'size_view_log_{self.name}'])
-        if logfile:
-            if st.session_state[f'reverse_view_log_{self.name}']:
-                logfile = '\n'.join(logfile.split('\n')[::-1])
-        with st.container(height=1200):
-            st.code(logfile)
 
     def status(self):
         if self.is_backtesting():
@@ -166,6 +150,7 @@ class BacktestV7QueueItem():
             new_os_path = os.path.dirname(pb7venv()) + os.pathsep + old_os_path
             os.environ['PATH'] = new_os_path
             cmd = [pb7venv(), '-u', PurePath(f'{pb7dir()}/src/backtest.py'), str(PurePath(f'{self.json}'))]
+            self.log.parent.mkdir(parents=True, exist_ok=True)
             log = open(self.log,"w")
             if platform.system() == "Windows":
                 creationflags = subprocess.DETACHED_PROCESS
@@ -288,7 +273,14 @@ class BacktestV7Queue:
                 qitem.filename = config["filename"]
                 qitem.json = config["json"]
                 qitem.exchange = config["exchange"]
-                qitem.log = Path(f'{PBGDIR}/data/bt_v7_queue/{qitem.filename}.log')
+                # Log path: data/logs/backtests/{filename}.log
+                # Auto-migrate from old location (data/bt_v7_queue/{filename}.log)
+                new_log = Path(f'{PBGDIR}/data/logs/backtests/{qitem.filename}.log')
+                old_log = Path(f'{PBGDIR}/data/bt_v7_queue/{qitem.filename}.log')
+                if old_log.exists() and not new_log.exists():
+                    new_log.parent.mkdir(parents=True, exist_ok=True)
+                    old_log.rename(new_log)
+                qitem.log = new_log
                 qitem.pidfile = Path(f'{PBGDIR}/data/bt_v7_queue/{qitem.filename}.pid')
                 qitem.config.config_file = qitem.json
                 qitem.config.load_config()
@@ -380,6 +372,8 @@ class BacktestV7Queue:
         if not "ed_key" in st.session_state:
             st.session_state.ed_key = 0
         ed_key = st.session_state.ed_key
+        # ── Process data_editor state BEFORE creating the segmented_control
+        # so that setting bt_v7_queue_view is allowed (widget not yet instantiated).
         if f'view_bt_v7_queue_{ed_key}' in st.session_state:
             ed = st.session_state[f'view_bt_v7_queue_{ed_key}']
             for row in ed["edited_rows"]:
@@ -393,13 +387,48 @@ class BacktestV7Queue:
                     bt = BacktestV7Results()
                     bt.results_path = f'{pb7dir()}/backtests/pbgui/{self.d[row]["item"].name}'
                     st.session_state.bt_v7_results = bt
-                    del st.session_state.bt_v7_queue
+                    st.session_state["_bt_v7_main_view_next"] = "Results"
                     st.rerun()
                 if "log" in ed["edited_rows"][row]:
-                    self.d[row]["item"].log_show = ed["edited_rows"][row]["log"]
-                    self.d[row]["log"] = ed["edited_rows"][row]["log"]
+                    checked = bool(ed["edited_rows"][row]["log"])
+                    if checked:
+                        # Exclusive selection: clear all others first
+                        for i, d_row in enumerate(self.d):
+                            d_row["item"].log_show = (i == int(row))
+                            d_row["log"] = (i == int(row))
+                        log_file = self.d[int(row)]["item"].log
+                        # Migrate old log location (data/bt_v7_queue/) → new location (data/logs/backtests/)
+                        if log_file and not log_file.exists():
+                            old_log = Path(f'{PBGDIR}/data/bt_v7_queue/{log_file.name}')
+                            if old_log.exists():
+                                log_file.parent.mkdir(parents=True, exist_ok=True)
+                                try:
+                                    old_log.rename(log_file)
+                                except Exception:
+                                    pass
+                        if log_file:
+                            st.session_state["bt_v7_queue_log_preselect"] = f"backtests/{log_file.name}"
+                        # Bump ed_key so data_editor re-renders with fresh checkbox state
+                        st.session_state.ed_key = ed_key + 1
+                        st.session_state["_bt_v7_main_view_next"] = "Log"
+                        st.rerun()
+                    else:
+                        self.d[int(row)]["item"].log_show = False
+                        self.d[int(row)]["log"] = False
+        # ── Queue table ──
+        # Clear log selection when returning to Queue tab so no checkbox stays ticked
+        prev = st.session_state.get("_bt_v7_queue_prev_view", "Queue")
+        if prev == "Log":
+            any_set = any(d_row["log"] for d_row in self.d)
+            if any_set:
+                for d_row in self.d:
+                    d_row["item"].log_show = False
+                    d_row["log"] = False
+                st.session_state.ed_key = st.session_state.ed_key + 1
+                st.session_state["_bt_v7_queue_prev_view"] = "Queue"
+                st.rerun()
+        st.session_state["_bt_v7_queue_prev_view"] = "Queue"
         column_config = {
-            # "id": None,
             "run": st.column_config.CheckboxColumn('Start/Stop', default=False),
             "view": st.column_config.CheckboxColumn(label="View Results"),
             "log": st.column_config.CheckboxColumn(label="View Logfile"),
@@ -409,9 +438,8 @@ class BacktestV7Queue:
             "filename": st.column_config.TextColumn(label="Filename"),
             "exchange": st.column_config.ListColumn(label="Exchange"),
             "finish": st.column_config.CheckboxColumn(label="Finished"),
-            }
-        #Display Queue
-        height = 36+(len(self.d))*35
+        }
+        height = 36 + (len(self.d)) * 35
         if "sort_bt_v7_queue" in st.session_state:
             if st.session_state.sort_bt_v7_queue != self.sort:
                 self.sort = st.session_state.sort_bt_v7_queue
@@ -424,19 +452,42 @@ class BacktestV7Queue:
                 self.save_sort_queue()
         else:
             st.session_state.sort_bt_v7_queue_order = self.sort_order
-        # Display sort options
         col1, col2 = st.columns([1, 9], vertical_alignment="bottom")
         with col1:
             st.selectbox("Sort by:", ['Time', 'Name', 'Status'], key=f'sort_bt_v7_queue', index=0)
         with col2:
             st.checkbox("Reverse", value=True, key=f'sort_bt_v7_queue_order')
-        # Sort results
         self.d = sorted(self.d, key=lambda x: x[st.session_state[f'sort_bt_v7_queue']], reverse=st.session_state[f'sort_bt_v7_queue_order'])
-        if height > 1000: height = 1016
+        if height > 1000:
+            height = 1016
         st.data_editor(data=self.d, height="auto", key=f'view_bt_v7_queue_{ed_key}', hide_index=None, column_order=None, column_config=column_config, disabled=['id','filename','name','finish','running'])
-        for item in self.items:
-            if item.log_show:
-                item.view_log()
+
+    def view_log(self):
+        """Render the log viewer for the currently selected backtest log."""
+        st.session_state["_bt_v7_queue_prev_view"] = "Log"
+        _log_item_name = ""
+        for d_row in self.d:
+            if d_row.get("log"):
+                _log_item_name = str(d_row.get("Name") or "")
+                # Ensure log is migrated to the canonical location before viewing
+                item = d_row["item"]
+                if item.log and not item.log.exists():
+                    old_log = Path(f'{PBGDIR}/data/bt_v7_queue/{item.log.name}')
+                    if old_log.exists():
+                        item.log.parent.mkdir(parents=True, exist_ok=True)
+                        try:
+                            old_log.rename(item.log)
+                            st.session_state["bt_v7_queue_log_preselect"] = f"backtests/{item.log.name}"
+                        except Exception:
+                            pass
+                break
+        preselect = st.session_state.get("bt_v7_queue_log_preselect", "")
+        if not preselect:
+            for item in self.items:
+                if item.is_running() and item.log:
+                    preselect = f"backtests/{item.log.name}"
+                    break
+        render_log_viewer(preselect=preselect, iframe_height_offset=300, display_title=_log_item_name)
 
     def load_sort_queue(self):
         pb_config = configparser.ConfigParser()
@@ -588,6 +639,67 @@ class BacktestV7Item(ConfigV7Editor):
             st.session_state.edit_bt_v7_gap_tolerance_ohlcvs_minutes = self.config.backtest.gap_tolerance_ohlcvs_minutes
         st.number_input("gap_tolerance_ohlcvs_minutes", min_value=0, step=1, key="edit_bt_v7_gap_tolerance_ohlcvs_minutes", help=pbgui_help.gap_tolerance_ohlcvs_minutes)
 
+    # ohlcv_source_dir
+    @st.fragment
+    def fragment_ohlcv_source_dir(self):
+        from pbgui_func import PBGDIR
+        
+        key = "edit_bt_v7_ohlcv_source_dir"
+        use_pbgui_key = "edit_bt_v7_use_pbgui_ohlcv"
+        pbgui_ohlcv_path = str(PBGDIR / "data" / "ohlcv")
+        
+        if not hasattr(self.config.backtest, "ohlcv_source_dir"):
+            setattr(self.config.backtest, "_ohlcv_source_dir", None)
+            if hasattr(self.config.backtest, "_backtest") and isinstance(self.config.backtest._backtest, dict):
+                self.config.backtest._backtest.setdefault("ohlcv_source_dir", None)
+        
+        # Initialize session state for checkbox
+        if use_pbgui_key not in st.session_state:
+            current = getattr(self.config.backtest, "ohlcv_source_dir", None)
+            if current is None and hasattr(self.config.backtest, "_backtest"):
+                current = self.config.backtest._backtest.get("ohlcv_source_dir")
+            # Auto-detect if current value is PBGui path
+            st.session_state[use_pbgui_key] = current == pbgui_ohlcv_path
+        
+        # Initialize session state for text input
+        if key not in st.session_state:
+            current = getattr(self.config.backtest, "ohlcv_source_dir", None)
+            if current is None and hasattr(self.config.backtest, "_backtest"):
+                current = self.config.backtest._backtest.get("ohlcv_source_dir")
+            st.session_state[key] = current or ""
+        
+        # Determine the actual value to use
+        use_pbgui = st.session_state[use_pbgui_key]
+        if use_pbgui:
+            value = pbgui_ohlcv_path
+            st.session_state[key] = value
+        else:
+            value = str(st.session_state.get(key) or "").strip()
+        
+        # Update config
+        if hasattr(type(self.config.backtest), "ohlcv_source_dir"):
+            self.config.backtest.ohlcv_source_dir = value if value else None
+        else:
+            self.config.backtest._ohlcv_source_dir = value if value else None
+            if hasattr(self.config.backtest, "_backtest") and isinstance(self.config.backtest._backtest, dict):
+                self.config.backtest._backtest["ohlcv_source_dir"] = self.config.backtest._ohlcv_source_dir
+        
+        # Layout: Checkbox and text input side by side
+        col_chk, col_val = st.columns([1, 3], vertical_alignment="top")
+        with col_chk:
+            st.checkbox(
+                "Use PBGui OHLCV data",
+                key=use_pbgui_key,
+                help="When enabled, use PBGui's market data from data/ohlcv instead of PB7's cache/historical_data"
+            )
+        with col_val:
+            st.text_input(
+                "ohlcv_source_dir",
+                key=key,
+                help=pbgui_help.ohlcv_source_dir,
+                disabled=use_pbgui
+            )
+
     # maker_fee_override
     @st.fragment
     def fragment_maker_fee_override(self):
@@ -635,6 +747,22 @@ class BacktestV7Item(ConfigV7Editor):
             st.session_state.edit_bt_v7_max_warmup_minutes = self.config.backtest.max_warmup_minutes
         st.number_input("max_warmup_minutes", min_value=0.0, step=1440.0, key="edit_bt_v7_max_warmup_minutes", help=pbgui_help.max_warmup_minutes)
 
+    # candle_interval_minutes
+    @st.fragment
+    def fragment_candle_interval_minutes(self):
+        if "edit_bt_v7_candle_interval_minutes" in st.session_state:
+            if st.session_state.edit_bt_v7_candle_interval_minutes != self.config.backtest.candle_interval_minutes:
+                self.config.backtest.candle_interval_minutes = st.session_state.edit_bt_v7_candle_interval_minutes
+        else:
+            st.session_state.edit_bt_v7_candle_interval_minutes = self.config.backtest.candle_interval_minutes
+        st.number_input(
+            "candle_interval_minutes",
+            min_value=1,
+            step=1,
+            key="edit_bt_v7_candle_interval_minutes",
+            help=pbgui_help.candle_interval_minutes,
+        )
+
     # filter_by_min_effective_cost
     @st.fragment
     def fragment_filter_by_min_effective_cost(self):
@@ -644,16 +772,6 @@ class BacktestV7Item(ConfigV7Editor):
         else:
             st.session_state.edit_bt_v7_filter_by_min_effective_cost = self.config.backtest.filter_by_min_effective_cost
         st.checkbox("filter_by_min_effective_cost", key="edit_bt_v7_filter_by_min_effective_cost", help=pbgui_help.bt_filter_by_min_effective_cost)
-
-    # combine_ohlcvs
-    @st.fragment
-    def fragment_combine_ohlcvs(self):
-        if "edit_bt_v7_combine_ohlcvs" in st.session_state:
-            if st.session_state.edit_bt_v7_combine_ohlcvs != self.config.backtest.combine_ohlcvs:
-                self.config.backtest.combine_ohlcvs = st.session_state.edit_bt_v7_combine_ohlcvs
-        else:
-            st.session_state.edit_bt_v7_combine_ohlcvs = self.config.backtest.combine_ohlcvs
-        st.checkbox("combine_ohlcvs", key="edit_bt_v7_combine_ohlcvs", help=pbgui_help.combine_ohlcvs)
 
     # compress_cache
     @st.fragment
@@ -695,23 +813,27 @@ class BacktestV7Item(ConfigV7Editor):
         )
     
     def _get_available_symbols(self, exchanges=None):
-        """Get available symbols from coindata for specified exchanges.
-        Returns normalized coin names (without USDT/USDC suffixes).
+        """Get available normalized coin names for specified exchanges from mapping.
         
         Args:
             exchanges: List of exchange names. If None, uses config.backtest.exchanges
         """
         if exchanges is None:
             exchanges = self.config.backtest.exchanges
-        
-        symbols = []
-        for exchange in V7.list():
-            if exchange in exchanges and f"coindata_{exchange}" in st.session_state:
-                symbols.extend(st.session_state[f"coindata_{exchange}"].symbols)
-        
-        # Normalize and deduplicate (BTCUSDT + BTCUSDC -> BTC)
-        normalized = [normalize_symbol(s) for s in symbols]
-        return sorted(list(set(normalized)))
+
+        if "pbcoindata" not in st.session_state:
+            st.session_state.pbcoindata = CoinData()
+        coindata = st.session_state.pbcoindata
+
+        coins = set()
+        for exchange in exchanges or []:
+            for record in coindata.load_mapping(exchange=exchange, use_cache=True):
+                coin = (record.get("coin") or "").upper()
+                if not coin:
+                    coin = normalize_symbol(record.get("symbol") or "")
+                if coin:
+                    coins.add(coin)
+        return sorted(coins)
     
     # All Suite and coin_sources methods are now inherited from ConfigV7Editor:
     # - fragment_coin_sources()
@@ -750,6 +872,155 @@ class BacktestV7Item(ConfigV7Editor):
             st.session_state.edit_bt_v7_btc_collateral_ltv_cap = self.config.backtest.btc_collateral_ltv_cap if self.config.backtest.btc_collateral_ltv_cap is not None else 0.0
         st.number_input("btc_collateral_ltv_cap", min_value=0.0, max_value=1.0, step=0.1, format="%.2f", key="edit_bt_v7_btc_collateral_ltv_cap", help=pbgui_help.btc_collateral_ltv_cap)
 
+    # market_settings_sources
+    @st.fragment
+    def fragment_market_settings_sources(self):
+        """UI for editing market_settings_sources with table and add/delete controls."""
+        
+        mss = self.config.backtest.market_settings_sources
+        # Show all V7 exchanges, not just the configured ones
+        available_exchanges = V7.list()
+        
+        # Expander with count
+        has_mss = bool(mss)
+        expander_title = f"**Market Settings Sources** ({len(mss)} configured)" if has_mss else "**Market Settings Sources**"
+        
+        with st.expander(expander_title, expanded=has_mss):
+            # Display existing mappings
+            if mss:
+                # Build DataFrame
+                rows = []
+                for coin, exchange in sorted(mss.items()):
+                    rows.append({
+                        "Delete": False,
+                        "Coin": coin,
+                        "Exchange": exchange
+                    })
+                df = pd.DataFrame(rows)
+                
+                # Show table with delete checkbox
+                edited_df = st.data_editor(
+                    df,
+                    width="stretch",
+                    num_rows="fixed",
+                    hide_index=True,
+                    column_config={
+                        "Delete": st.column_config.CheckboxColumn(
+                            "Delete",
+                            default=False
+                        ),
+                        "Coin": st.column_config.TextColumn(
+                            "Coin",
+                            disabled=True
+                        ),
+                        "Exchange": st.column_config.TextColumn(
+                            "Exchange",
+                            disabled=True
+                        )
+                    },
+                    key="edit_bt_v7_market_settings_sources_table"
+                )
+                
+                # Process deletions
+                coins_to_delete = []
+                for _, row in edited_df.iterrows():
+                    if row["Delete"]:
+                        coins_to_delete.append(row["Coin"])
+                
+                if coins_to_delete:
+                    for coin in coins_to_delete:
+                        if coin in mss:
+                            del mss[coin]
+                    self.config.backtest.market_settings_sources = mss
+                    st.rerun()
+            
+            # Add new mapping section
+            col1, col2, col3 = st.columns([1.5, 1.5, 1], vertical_alignment="bottom")
+            
+            with col1:
+                # Step 1: Select coin from approved_coins (with "All Coins" option)
+                available_coins = []
+                def _canonical_coin_symbol(coin):
+                    symbol = str(coin).strip()
+                    if not symbol:
+                        return ""
+                    lower = symbol.lower()
+                    if lower.startswith("xyz:") or lower.startswith("xyz-"):
+                        return f"xyz:{symbol[4:].strip().upper()}"
+                    return normalize_symbol(symbol)
+                def _normalize_ui_coin(coin):
+                    return _canonical_coin_symbol(coin)
+                try:
+                    raw_coins = list(set(
+                        self.config.live.approved_coins.long + 
+                        self.config.live.approved_coins.short
+                    ))
+                    # Normalize coins (remove USDT, etc.) and filter
+                    available_coins = sorted([
+                        c for c in {_normalize_ui_coin(coin) for coin in raw_coins if coin}
+                        if c and c not in mss
+                    ])
+                except:
+                    available_coins = []
+                
+                # Add "All Coins" option at the beginning
+                coin_options = (["✻ All Coins"] + available_coins) if available_coins else []
+                
+                if coin_options:
+                    selected_coin = st.selectbox(
+                        "Coin",
+                        options=coin_options,
+                        key="edit_bt_v7_mss_coin",
+                        help="Select a coin or '✻ All Coins' to apply same exchange to all coins at once"
+                    )
+                else:
+                    st.info("No more coins available to configure")
+                    selected_coin = None
+            
+            with col2:
+                # Step 2: Select exchange
+                if selected_coin:
+                    selected_exchange = st.selectbox(
+                        "Exchange",
+                        options=available_exchanges,
+                        key="edit_bt_v7_mss_exchange",
+                        help="Exchange to use for market settings (fees, min quantities, etc.)"
+                    )
+                else:
+                    selected_exchange = None
+            
+            with col3:
+                # Button changes based on whether "All Coins" is selected
+                is_all_coins = selected_coin and selected_coin.startswith("✻")
+                button_label = "🔄 Apply to All" if is_all_coins else "➕ Add"
+                button_key = f"edit_bt_v7_mss_{'apply_all' if is_all_coins else 'add'}"
+                
+                if st.button(button_label, key=button_key,
+                            disabled=not (selected_coin and selected_exchange)):
+                    if is_all_coins and available_coins:
+                        # Apply to all coins
+                        for coin in available_coins:
+                            mss[coin] = selected_exchange
+                        self.config.backtest.market_settings_sources = mss
+                        st.success(f"Applied {selected_exchange} to {len(available_coins)} coins ✓")
+                        st.rerun()
+                    elif not is_all_coins and selected_coin not in mss:
+                        # Add single coin
+                        mss[selected_coin] = selected_exchange
+                        self.config.backtest.market_settings_sources = mss
+                        st.rerun()
+
+
+    # volume_normalization
+    @st.fragment
+    def fragment_volume_normalization(self):
+        if "edit_bt_v7_volume_normalization" in st.session_state:
+            if st.session_state.edit_bt_v7_volume_normalization != self.config.backtest.volume_normalization:
+                self.config.backtest.volume_normalization = st.session_state.edit_bt_v7_volume_normalization
+        else:
+            st.session_state.edit_bt_v7_volume_normalization = self.config.backtest.volume_normalization
+        st.checkbox("volume_normalization", help=pbgui_help.volume_normalization, key="edit_bt_v7_volume_normalization")
+
     # filters
     def fragment_filter_coins(self):
         col1, col2, col3, col4, col5 = st.columns([1,1,1,0.5,0.5], vertical_alignment="bottom")
@@ -764,59 +1035,145 @@ class BacktestV7Item(ConfigV7Editor):
             self.fragment_notices_ignore()
         with col5:
             st.checkbox("apply_filters", value=False, help=pbgui_help.apply_filters, key="edit_bt_v7_apply_filters")
+        def _canonical_coin_symbol(coin):
+            symbol = str(coin).strip()
+            if not symbol:
+                return ""
+            lower = symbol.lower()
+            if lower.startswith("xyz:") or lower.startswith("xyz-"):
+                return f"xyz:{symbol[4:].strip().upper()}"
+            return normalize_symbol(symbol)
+        def _allowed_hyperliquid_market_data_coins() -> set[str]:
+            allowed = set()
+            for record in coindata.load_mapping(exchange="hyperliquid", use_cache=True):
+                if not bool(record.get("swap", False)) or not bool(record.get("active", True)) or not bool(record.get("linear", True)):
+                    continue
+                dex = str(record.get("dex") or "").strip().lower()
+                if dex not in ("", "xyz"):
+                    continue
+                coin = _canonical_coin_symbol(record.get("coin") or "")
+                if coin:
+                    allowed.add(coin)
+            return allowed
+        def _normalize_list(items):
+            normalized = []
+            for item in items:
+                base = _canonical_coin_symbol(item)
+                if base and base not in normalized:
+                    normalized.append(base)
+            return normalized
         # Init session state for approved_coins
         if "edit_bt_v7_approved_coins_long" in st.session_state:
             if st.session_state.edit_bt_v7_approved_coins_long != self.config.live.approved_coins.long:
                 self.config.live.approved_coins.long = st.session_state.edit_bt_v7_approved_coins_long
         else:
+            self.config.live.approved_coins.long = _normalize_list(self.config.live.approved_coins.long)
             st.session_state.edit_bt_v7_approved_coins_long = self.config.live.approved_coins.long
         if "edit_bt_v7_approved_coins_short" in st.session_state:
             if st.session_state.edit_bt_v7_approved_coins_short != self.config.live.approved_coins.short:
                 self.config.live.approved_coins.short = st.session_state.edit_bt_v7_approved_coins_short
         else:
+            self.config.live.approved_coins.short = _normalize_list(self.config.live.approved_coins.short)
             st.session_state.edit_bt_v7_approved_coins_short = self.config.live.approved_coins.short
         # Init session state for ignored_coins
         if "edit_bt_v7_ignored_coins_long" in st.session_state:
             if st.session_state.edit_bt_v7_ignored_coins_long != self.config.live.ignored_coins.long:
                 self.config.live.ignored_coins.long = st.session_state.edit_bt_v7_ignored_coins_long
         else:
+            self.config.live.ignored_coins.long = _normalize_list(self.config.live.ignored_coins.long)
             st.session_state.edit_bt_v7_ignored_coins_long = self.config.live.ignored_coins.long
         if "edit_bt_v7_ignored_coins_short" in st.session_state:
             if st.session_state.edit_bt_v7_ignored_coins_short != self.config.live.ignored_coins.short:
                 self.config.live.ignored_coins.short = st.session_state.edit_bt_v7_ignored_coins_short
         else:
+            self.config.live.ignored_coins.short = _normalize_list(self.config.live.ignored_coins.short)
             st.session_state.edit_bt_v7_ignored_coins_short = self.config.live.ignored_coins.short
         # Apply filters
         if st.session_state.edit_bt_v7_apply_filters:
-            self.config.live.approved_coins.long = sorted(list(set(st.session_state.coindata_bybit.approved_coins + st.session_state.coindata_binance.approved_coins + st.session_state.coindata_gateio.approved_coins + st.session_state.coindata_bitget.approved_coins)))
-            self.config.live.approved_coins.short = sorted(list(set(st.session_state.coindata_bybit.approved_coins + st.session_state.coindata_binance.approved_coins + st.session_state.coindata_gateio.approved_coins + st.session_state.coindata_bitget.approved_coins)))
-            self.config.live.ignored_coins.long = sorted(list(set(st.session_state.coindata_bybit.ignored_coins + st.session_state.coindata_binance.ignored_coins + st.session_state.coindata_gateio.ignored_coins + st.session_state.coindata_bitget.ignored_coins)))
-            self.config.live.ignored_coins.short = sorted(list(set(st.session_state.coindata_bybit.ignored_coins + st.session_state.coindata_binance.ignored_coins + st.session_state.coindata_gateio.ignored_coins + st.session_state.coindata_bitget.ignored_coins)))
-        # Remove unavailable symbols
-        symbols = []
-        if "bybit" in self.config.backtest.exchanges:
-            symbols.extend(st.session_state.coindata_bybit.symbols)
-        if "binance" in self.config.backtest.exchanges:
-            symbols.extend(st.session_state.coindata_binance.symbols)
-        if "gateio" in self.config.backtest.exchanges:
-            symbols.extend(st.session_state.coindata_gateio.symbols)
-        if "bitget" in self.config.backtest.exchanges:
-            symbols.extend(st.session_state.coindata_bitget.symbols)
-        symbols = list(set(symbols))
-        # sort symbols
-        symbols = sorted(symbols)
-        for symbol in self.config.live.approved_coins.long.copy():
-            if symbol not in symbols:
-                self.config.live.approved_coins.long.remove(symbol)
-        for symbol in self.config.live.approved_coins.short.copy():
-            if symbol not in symbols:
-                self.config.live.approved_coins.short.remove(symbol)
-        for symbol in self.config.live.ignored_coins.long.copy():
-            if symbol not in symbols:
-                self.config.live.ignored_coins.long.remove(symbol)
-        for symbol in self.config.live.ignored_coins.short.copy():
-            if symbol not in symbols:
-                self.config.live.ignored_coins.short.remove(symbol)
+            if "pbcoindata" not in st.session_state:
+                st.session_state.pbcoindata = CoinData()
+            coindata = st.session_state.pbcoindata
+
+            approved = set()
+            ignored = set()
+            for exchange in self.config.backtest.exchanges:
+                approved_coins, ignored_coins = coindata.filter_mapping(
+                    exchange=exchange,
+                    market_cap_min_m=self.config.pbgui.market_cap,
+                    vol_mcap_max=self.config.pbgui.vol_mcap,
+                    only_cpt=self.config.pbgui.only_cpt,
+                    notices_ignore=self.config.pbgui.notices_ignore,
+                    tags=self.config.pbgui.tags,
+                    quote_filter=None,
+                    use_cache=True,
+                )
+                approved.update(approved_coins)
+                ignored.update(ignored_coins)
+
+            ignored -= approved
+            approved_sorted = sorted({_canonical_coin_symbol(c) for c in approved if _canonical_coin_symbol(c)})
+            ignored_sorted = sorted({_canonical_coin_symbol(c) for c in ignored if _canonical_coin_symbol(c)})
+            self.config.live.approved_coins.long = approved_sorted
+            self.config.live.approved_coins.short = approved_sorted
+            self.config.live.ignored_coins.long = ignored_sorted
+            self.config.live.ignored_coins.short = ignored_sorted
+        # Remove unavailable symbols (mapping-only)
+        mapping_coins = set()
+        notices_by_coin = {}
+        if "pbcoindata" not in st.session_state:
+            st.session_state.pbcoindata = CoinData()
+        coindata = st.session_state.pbcoindata
+        for exchange in self.config.backtest.exchanges:
+            exchange_symbols, _ = coindata.filter_mapping(
+                exchange=exchange,
+                market_cap_min_m=0,
+                vol_mcap_max=float("inf"),
+                only_cpt=False,
+                notices_ignore=False,
+                tags=[],
+                quote_filter=None,
+                use_cache=True,
+                active_only=True,
+            )
+
+            mapping_coins.update(
+                {
+                    _canonical_coin_symbol(symbol)
+                    for symbol in exchange_symbols
+                    if _canonical_coin_symbol(symbol)
+                }
+            )
+            for record in coindata.load_mapping(exchange=exchange, use_cache=True):
+                coin = _canonical_coin_symbol(record.get("coin") or "")
+                notice = str(record.get("notice") or "").strip()
+                if coin and coin in mapping_coins and notice and coin not in notices_by_coin:
+                    notices_by_coin[coin] = notice
+
+        preserved_stock_perps = {
+            _canonical_coin_symbol(c)
+            for c in (
+                self.config.live.approved_coins.long
+                + self.config.live.approved_coins.short
+                + self.config.live.ignored_coins.long
+                + self.config.live.ignored_coins.short
+            )
+            if _canonical_coin_symbol(c).startswith("xyz:")
+        }
+        mapping_coins.update(preserved_stock_perps)
+        symbols = sorted(mapping_coins)
+
+        self.config.live.approved_coins.long = [
+            coin for coin in self.config.live.approved_coins.long if coin in mapping_coins
+        ]
+        self.config.live.approved_coins.short = [
+            coin for coin in self.config.live.approved_coins.short if coin in mapping_coins
+        ]
+        self.config.live.ignored_coins.long = [
+            coin for coin in self.config.live.ignored_coins.long if coin in mapping_coins
+        ]
+        self.config.live.ignored_coins.short = [
+            coin for coin in self.config.live.ignored_coins.short if coin in mapping_coins
+        ]
         # Remove from approved_coins when in ignored coins
         for symbol in self.config.live.ignored_coins.long:
             if symbol in self.config.live.approved_coins.long:
@@ -835,14 +1192,44 @@ class BacktestV7Item(ConfigV7Editor):
             st.session_state.edit_bt_v7_ignored_coins_short = self.config.live.ignored_coins.short
         # Find coins with notices
         for coin in list(set(self.config.live.approved_coins.long + self.config.live.approved_coins.short)):
-            if coin in st.session_state.coindata_bybit.symbols_notices:
-                st.warning(f'{coin}: {st.session_state.coindata_bybit.symbols_notices[coin]}')
-            elif coin in st.session_state.coindata_binance.symbols_notices:
-                st.warning(f'{coin}: {st.session_state.coindata_binance.symbols_notices[coin]}')
-            elif coin in st.session_state.coindata_gateio.symbols_notices:
-                st.warning(f'{coin}: {st.session_state.coindata_gateio.symbols_notices[coin]}')
-            elif coin in st.session_state.coindata_bitget.symbols_notices:
-                st.warning(f'{coin}: {st.session_state.coindata_bitget.symbols_notices[coin]}')
+            base = normalize_symbol(coin)
+            notice = notices_by_coin.get(coin) or notices_by_coin.get(base)
+            if notice:
+                st.warning(f'{base}: {notice}')
+        # Warn if stock perps selected without TradFi configured
+        _all_approved = self.config.live.approved_coins.long + self.config.live.approved_coins.short
+        _stock_perps = [
+            c for c in _all_approved
+            if str(c).lower().startswith("xyz:") or str(c).lower().startswith("xyz-")
+        ]
+        if _stock_perps:
+            try:
+                _start = datetime.date.fromisoformat(self.config.backtest.start_date)
+                _needs_tradfi = (datetime.date.today() - _start).days > 7
+            except Exception:
+                _needs_tradfi = True
+            if _needs_tradfi:
+                _tradfi = st.session_state.users.tradfi if "users" in st.session_state else {}
+                _has_tradfi = bool(_tradfi)
+                if not _has_tradfi:
+                    try:
+                        _cfg = configparser.ConfigParser()
+                        _cfg.read("pbgui.ini")
+                        _has_alpaca = bool((_cfg.get("tradfi_profiles", "alpaca_api_key", fallback="") or "").strip()) and bool(
+                            (_cfg.get("tradfi_profiles", "alpaca_api_secret", fallback="") or "").strip()
+                        )
+                        _has_polygon = bool((_cfg.get("tradfi_profiles", "polygon_api_key", fallback="") or "").strip())
+                        _has_tradfi = _has_alpaca or _has_polygon
+                    except Exception:
+                        _has_tradfi = False
+                if not _has_tradfi:
+                    _names = ', '.join(_stock_perps[:3]) + ('...' if len(_stock_perps) > 3 else '')
+                    st.warning(
+                        f"Stock perp symbols detected ({_names}). "
+                        "Backtests older than 7 days require a **TradFi data provider**. "
+                        "Please configure it on the **API-Keys** page (TradFi section at the bottom).",
+                        icon=":material/warning:",
+                    )
         # Select approved coins
         col1, col2 = st.columns([1,1], vertical_alignment="bottom")
         with col1:
@@ -858,18 +1245,10 @@ class BacktestV7Item(ConfigV7Editor):
         if "edit_bt_v7_market_cap" in st.session_state:
             if st.session_state.edit_bt_v7_market_cap != self.config.pbgui.market_cap:
                 self.config.pbgui.market_cap = st.session_state.edit_bt_v7_market_cap
-                st.session_state.coindata_binance.market_cap = self.config.pbgui.market_cap
-                st.session_state.coindata_bybit.market_cap = self.config.pbgui.market_cap
-                st.session_state.coindata_gateio.market_cap = self.config.pbgui.market_cap
-                st.session_state.coindata_bitget.market_cap = self.config.pbgui.market_cap
                 if st.session_state.edit_bt_v7_apply_filters:
                     st.rerun()
         else:
             st.session_state.edit_bt_v7_market_cap = self.config.pbgui.market_cap
-            st.session_state.coindata_bybit.market_cap = self.config.pbgui.market_cap
-            st.session_state.coindata_binance.market_cap = self.config.pbgui.market_cap
-            st.session_state.coindata_gateio.market_cap = self.config.pbgui.market_cap
-            st.session_state.coindata_bitget.market_cap = self.config.pbgui.market_cap
         st.number_input("market_cap", min_value=0, step=50, format="%.d", key="edit_bt_v7_market_cap", help=pbgui_help.market_cap)
     
     @st.fragment
@@ -878,18 +1257,10 @@ class BacktestV7Item(ConfigV7Editor):
         if "edit_bt_v7_vol_mcap" in st.session_state:
             if st.session_state.edit_bt_v7_vol_mcap != self.config.pbgui.vol_mcap:
                 self.config.pbgui.vol_mcap = st.session_state.edit_bt_v7_vol_mcap
-                st.session_state.coindata_bybit.vol_mcap = self.config.pbgui.vol_mcap
-                st.session_state.coindata_binance.vol_mcap = self.config.pbgui.vol_mcap
-                st.session_state.coindata_gateio.vol_mcap = self.config.pbgui.vol_mcap
-                st.session_state.coindata_bitget.vol_mcap = self.config.pbgui.vol_mcap
                 if st.session_state.edit_bt_v7_apply_filters:
                     st.rerun()
         else:
             st.session_state.edit_bt_v7_vol_mcap = round(float(self.config.pbgui.vol_mcap),2)
-            st.session_state.coindata_bybit.vol_mcap = self.config.pbgui.vol_mcap
-            st.session_state.coindata_binance.vol_mcap = self.config.pbgui.vol_mcap
-            st.session_state.coindata_gateio.vol_mcap = self.config.pbgui.vol_mcap
-            st.session_state.coindata_bitget.vol_mcap = self.config.pbgui.vol_mcap
         st.number_input("vol/mcap", min_value=0.0, step=0.05, format="%.2f", key="edit_bt_v7_vol_mcap", help=pbgui_help.vol_mcap)
 
     @st.fragment
@@ -898,20 +1269,17 @@ class BacktestV7Item(ConfigV7Editor):
         if "edit_bt_v7_tags" in st.session_state:
             if st.session_state.edit_bt_v7_tags != self.config.pbgui.tags:
                 self.config.pbgui.tags = st.session_state.edit_bt_v7_tags
-                st.session_state.coindata_bybit.tags = self.config.pbgui.tags
-                st.session_state.coindata_binance.tags = self.config.pbgui.tags
-                st.session_state.coindata_gateio.tags = self.config.pbgui.tags
-                st.session_state.coindata_bitget.tags = self.config.pbgui.tags
                 if st.session_state.edit_bt_v7_apply_filters:
                     st.rerun()
         else:
             st.session_state.edit_bt_v7_tags = self.config.pbgui.tags
-            st.session_state.coindata_bybit.tags = self.config.pbgui.tags
-            st.session_state.coindata_binance.tags = self.config.pbgui.tags
-            st.session_state.coindata_gateio.tags = self.config.pbgui.tags
-            st.session_state.coindata_bitget.tags = self.config.pbgui.tags
-        # remove duplicates from tags and sort them
-        tags = sorted(list(set(st.session_state.coindata_bybit.all_tags + st.session_state.coindata_binance.all_tags + st.session_state.coindata_gateio.all_tags + st.session_state.coindata_bitget.all_tags)))
+        if "pbcoindata" not in st.session_state:
+            st.session_state.pbcoindata = CoinData()
+        coindata = st.session_state.pbcoindata
+        tags = set()
+        for exchange in self.config.backtest.exchanges:
+            tags.update(coindata.get_mapping_tags(exchange=exchange, use_cache=True))
+        tags = sorted(tags)
         st.multiselect("tags", tags, key="edit_bt_v7_tags", help=pbgui_help.coindata_tags)
 
     # only_cpt
@@ -920,16 +1288,10 @@ class BacktestV7Item(ConfigV7Editor):
         if "edit_bt_v7_only_cpt" in st.session_state:
             if st.session_state.edit_bt_v7_only_cpt != self.config.pbgui.only_cpt:
                 self.config.pbgui.only_cpt = st.session_state.edit_bt_v7_only_cpt
-                st.session_state.coindata_bybit.only_cpt = self.config.pbgui.only_cpt
-                st.session_state.coindata_binance.only_cpt = self.config.pbgui.only_cpt
-                st.session_state.coindata_bitget.only_cpt = self.config.pbgui.only_cpt
                 if st.session_state.edit_bt_v7_apply_filters:
                     st.rerun()
         else:
             st.session_state.edit_bt_v7_only_cpt = self.config.pbgui.only_cpt
-            st.session_state.coindata_bybit.only_cpt = self.config.pbgui.only_cpt
-            st.session_state.coindata_binance.only_cpt = self.config.pbgui.only_cpt
-            st.session_state.coindata_bitget.only_cpt = self.config.pbgui.only_cpt
         st.checkbox("only_cpt", key="edit_bt_v7_only_cpt", help=pbgui_help.only_cpt)
     
     # notices_ignore
@@ -938,34 +1300,15 @@ class BacktestV7Item(ConfigV7Editor):
         if "edit_bt_v7_notices_ignore" in st.session_state:
             if st.session_state.edit_bt_v7_notices_ignore != self.config.pbgui.notices_ignore:
                 self.config.pbgui.notices_ignore = st.session_state.edit_bt_v7_notices_ignore
-                st.session_state.coindata_bybit.notices_ignore = self.config.pbgui.notices_ignore
-                st.session_state.coindata_binance.notices_ignore = self.config.pbgui.notices_ignore
-                st.session_state.coindata_gateio.notices_ignore = self.config.pbgui.notices_ignore
-                st.session_state.coindata_bitget.notices_ignore = self.config.pbgui.notices_ignore
                 if st.session_state.edit_bt_v7_apply_filters:
                     st.rerun()
         else:
             st.session_state.edit_bt_v7_notices_ignore = self.config.pbgui.notices_ignore
-            st.session_state.coindata_bybit.notices_ignore = self.config.pbgui.notices_ignore
-            st.session_state.coindata_binance.notices_ignore = self.config.pbgui.notices_ignore
-            st.session_state.coindata_gateio.notices_ignore = self.config.pbgui.notices_ignore
-            st.session_state.coindata_bitget.notices_ignore = self.config.pbgui.notices_ignore
         st.checkbox("notices_ignore", key="edit_bt_v7_notices_ignore", help=pbgui_help.notices_ignore)
 
     def edit(self):
-        # Init coindata
-        if "coindata_bybit" not in st.session_state:
-            st.session_state.coindata_bybit = CoinData()
-            st.session_state.coindata_bybit.exchange = "bybit"
-        if "coindata_binance" not in st.session_state:
-            st.session_state.coindata_binance = CoinData()
-            st.session_state.coindata_binance.exchange = "binance"
-        if "coindata_gateio" not in st.session_state:
-            st.session_state.coindata_gateio = CoinData()
-            st.session_state.coindata_gateio.exchange = "gateio"
-        if "coindata_bitget" not in st.session_state:
-            st.session_state.coindata_bitget = CoinData()
-            st.session_state.coindata_bitget.exchange = "bitget"
+        if "pbcoindata" not in st.session_state:
+            st.session_state.pbcoindata = CoinData()
         # Display Editor
         col1, col2, col3, col4, col5, col6 = st.columns([1,1,0.5,0.5,0.5,0.5])
         with col1:
@@ -980,29 +1323,36 @@ class BacktestV7Item(ConfigV7Editor):
             self.fragment_btc_collateral_cap()
         with col6:
             self.fragment_btc_collateral_ltv_cap()
-        col1, col2, col3, col4, col5, col6 = st.columns([1,1,0.5,0.5,0.5,0.5])
+        col1, col2, col3, col4, col5, col6, col7 = st.columns([1,0.5,0.5,0.5,0.5,0.5,0.5])
         with col1:
             self.fragment_starting_balance()
         with col2:
-            self.fragment_minimum_coin_age_days()
+            self.fragment_candle_interval_minutes()
         with col3:
-            self.fragment_gap_tolerance_ohlcvs_minutes()
+            self.fragment_minimum_coin_age_days()
         with col4:
-            self.fragment_max_warmup_minutes()
+            self.fragment_gap_tolerance_ohlcvs_minutes()
         with col5:
-            self.fragment_balance_sample_divider()
+            self.fragment_max_warmup_minutes()
         with col6:
+            self.fragment_balance_sample_divider()
+        with col7:
             self.fragment_logging()
+        col1, col2 = st.columns([1, 1], vertical_alignment="bottom")
+        with col1:
+            self.fragment_ohlcv_source_dir()
+        with col2:
+            self.fragment_market_settings_sources()
         # Backtest Options
         col1, col2, col3, col4 = st.columns([1,1,1,1])
         with col1:
-            self.fragment_combine_ohlcvs()
-        with col2:
             self.fragment_compress_cache()
-        with col3:
+        with col2:
             self.fragment_filter_by_min_effective_cost()
-        with col4:
+        with col3:
             self.fragment_maker_fee_override()
+        with col4:
+            self.fragment_volume_normalization()
         # coin_sources (full width)
         self.fragment_coin_sources()
         # Suite (multi-scenario)
@@ -1178,10 +1528,18 @@ class BacktestV7Result:
     def initialize(self):
         self.time = None
         self.result = self.load_result()
-        self.config = ConfigV7(PurePath(f'{self.result_path}/config.json'))
-        self.config.load_config()
-        self.backtest_config = self.load_backtest_config()
-        self.ed = self.config.backtest.end_date
+        self.config = None
+        self.backtest_config = None
+        self.ed = datetime.date.today().strftime("%Y-%m-%d")
+        self.exchanges = []
+        self.base_dir = ""
+        self.btc_collateral_cap = 0.0
+        self.twe_long = 0.0
+        self.twe_short = 0.0
+        self.pos_long = 0.0
+        self.pos_short = 0.0
+        self.starting_balance = 0.0
+        self._load_config_summary()
         # Support both old and new JSON formats
         # New format has _usd/_btc suffixes, old format has no suffix
         if self.result:
@@ -1202,10 +1560,17 @@ class BacktestV7Result:
             self.drawdown_worst = 0
             self.sharpe_ratio = 0
             self.equity_balance_diff_neg_max = None
-        self.starting_balance = self.config.backtest.starting_balance
         self.be = None
-        self.final_balance, self.final_balance_btc = self.load_final_balance()
+        gain = 0.0
+        try:
+            if self.result:
+                gain = float(self.result.get("gain_usd") or self.result.get("gain") or 0.0)
+        except Exception:
+            gain = 0.0
+        self.final_balance = float(self.starting_balance) * gain if self.starting_balance else 0.0
+        self.final_balance_btc = 0
         self.fills = None
+        self._has_timeseries_data = None
         # If the analysis indicates liquidation, reflect that in the final balances
         try:
             if self.is_liquidated():
@@ -1213,6 +1578,71 @@ class BacktestV7Result:
                 self.final_balance_btc = 0
         except Exception:
             pass
+
+    def _load_config_summary(self):
+        cfg_path = Path(f'{self.result_path}/config.json')
+        try:
+            with open(cfg_path, "r", encoding='utf-8') as f:
+                cfg = json.load(f)
+        except Exception:
+            return
+
+        backtest_cfg = cfg.get("backtest", {}) if isinstance(cfg, dict) else {}
+        bot_cfg = cfg.get("bot", {}) if isinstance(cfg, dict) else {}
+        long_cfg = bot_cfg.get("long", {}) if isinstance(bot_cfg, dict) else {}
+        short_cfg = bot_cfg.get("short", {}) if isinstance(bot_cfg, dict) else {}
+
+        self.ed = str(backtest_cfg.get("end_date") or self.ed)
+        self.exchanges = backtest_cfg.get("exchanges", [])
+        self.base_dir = str(backtest_cfg.get("base_dir") or "")
+        self.starting_balance = float(backtest_cfg.get("starting_balance") or 0.0)
+        self.btc_collateral_cap = float(backtest_cfg.get("btc_collateral_cap") or 0.0)
+        self.twe_long = float(long_cfg.get("total_wallet_exposure_limit") or 0.0)
+        self.twe_short = float(short_cfg.get("total_wallet_exposure_limit") or 0.0)
+        self.pos_long = float(long_cfg.get("n_positions") or 0.0)
+        self.pos_short = float(short_cfg.get("n_positions") or 0.0)
+
+    def ensure_config_loaded(self):
+        if self.config is not None:
+            return
+        self.config = ConfigV7(PurePath(f'{self.result_path}/config.json'))
+        self.config.load_config()
+        self.backtest_config = self.load_backtest_config()
+        self.ed = self.config.backtest.end_date
+
+    def _result_file_has_data_rows(self, path: Path, is_gzip: bool = False) -> bool:
+        try:
+            if not path.exists():
+                return False
+            if is_gzip:
+                import gzip
+
+                with gzip.open(path, 'rt', encoding='utf-8') as f:
+                    _ = f.readline()  # header
+                    return bool(f.readline())
+            with open(path, 'r', encoding='utf-8') as f:
+                _ = f.readline()  # header
+                return bool(f.readline())
+        except Exception:
+            return False
+
+    def _has_nonempty_timeseries_data(self) -> bool:
+        if self._has_timeseries_data is not None:
+            return bool(self._has_timeseries_data)
+
+        fills_csv = Path(f'{self.result_path}/fills.csv')
+        fills_gz = Path(f'{self.result_path}/fills.csv.gz')
+        be_csv = Path(f'{self.result_path}/balance_and_equity.csv')
+        be_gz = Path(f'{self.result_path}/balance_and_equity.csv.gz')
+
+        has_data = (
+            self._result_file_has_data_rows(fills_csv)
+            or self._result_file_has_data_rows(fills_gz, is_gzip=True)
+            or self._result_file_has_data_rows(be_csv)
+            or self._result_file_has_data_rows(be_gz, is_gzip=True)
+        )
+        self._has_timeseries_data = has_data
+        return has_data
 
     def is_liquidated(self) -> bool:
         """Return True if the backtest ended in liquidation.
@@ -1224,7 +1654,12 @@ class BacktestV7Result:
         try:
             if self.equity_balance_diff_neg_max is None:
                 return False
-            return float(self.equity_balance_diff_neg_max) >= 1.0
+            if float(self.equity_balance_diff_neg_max) < 1.0:
+                return False
+
+            # Guard against degenerate result artifacts where analysis exists but
+            # fills/balance files contain headers only (no actual time-series rows).
+            return self._has_nonempty_timeseries_data()
         except Exception:
             return False
     
@@ -1238,7 +1673,7 @@ class BacktestV7Result:
             with open(r, "r", encoding='utf-8') as f:
                 return json.load(f)
         except Exception as e:
-            print(f'{str(r)} is corrupted {e}')
+            _log('BacktestV7', f'{str(r)} is corrupted {e}', level='WARNING', meta={'traceback': traceback.format_exc()})
     
     def load_backtest_config(self):
         r = Path(f'{self.result_path}/config.json')
@@ -1246,7 +1681,7 @@ class BacktestV7Result:
             with open(r, "r", encoding='utf-8') as f:
                 return f.read()
         except Exception as e:
-            print(f'{str(r)} is corrupted {e}')
+            _log('BacktestV7', f'{str(r)} is corrupted {e}', level='WARNING', meta={'traceback': traceback.format_exc()})
 
     def load_final_balance(self):
         balance = Path(f'{self.result_path}/balance_and_equity.csv')
@@ -1300,9 +1735,9 @@ class BacktestV7Result:
         return 0, 0
 
     def load_be(self):
-        print(f"Loading balance and equity data for {self.result_path}")
+        _log('BacktestV7', f'Loading balance and equity data for {self.result_path}', level='DEBUG')
         if self.be is None:
-            print("Balance and equity data not loaded, loading now...")
+            _log('BacktestV7', 'Balance and equity data not loaded, loading now...', level='DEBUG')
             # Try both .csv and .csv.gz
             be = f'{self.result_path}/balance_and_equity.csv'
             be_gz = f'{self.result_path}/balance_and_equity.csv.gz'
@@ -1311,11 +1746,11 @@ class BacktestV7Result:
             compression = None
             
             if Path(be).exists():
-                print("Balance and equity file exists, reading...") 
+                _log('BacktestV7', 'Balance and equity file exists, reading...', level='DEBUG')
                 file_path = be
                 compression = None
             elif Path(be_gz).exists():
-                print("Balance and equity .gz file exists, reading...")
+                _log('BacktestV7', 'Balance and equity .gz file exists, reading...', level='DEBUG')
                 file_path = be_gz
                 compression = 'gzip'
             
@@ -1338,7 +1773,7 @@ class BacktestV7Result:
                     self.be['time'] = self.be.index
                 except (ValueError, TypeError):
                     # Old format: index is minutes (numeric)
-                    print("Using old format (minutes-based index)")
+                    _log('BacktestV7', 'Using old format (minutes-based index)', level='DEBUG')
                     timestamp = datetime.datetime.strptime(self.ed, '%Y-%m-%d').timestamp()
                     start_time = timestamp - (float(self.be.index[-1]) * 60)
                     self.be['time'] = datetime.datetime.fromtimestamp(start_time) + pd.to_timedelta(self.be.index, unit='m')
@@ -1348,28 +1783,69 @@ class BacktestV7Result:
             # Try both .csv and .csv.gz
             fills = f'{self.result_path}/fills.csv'
             fills_gz = f'{self.result_path}/fills.csv.gz'
-            
+
+            file_path = None
+            compression = None
             if Path(fills).exists():
-                self.fills = pd.read_csv(fills)
-                timestamp = datetime.datetime.strptime(self.ed, '%Y-%m-%d').timestamp()
-                start_time = timestamp - (self.fills['minute'].iloc[-1] * 60)
-                self.fills['time'] = datetime.datetime.fromtimestamp(start_time) + pd.to_timedelta(self.fills['minute'], unit='m')
+                file_path = fills
             elif Path(fills_gz).exists():
-                self.fills = pd.read_csv(fills_gz, compression='gzip')
+                file_path = fills_gz
+                compression = 'gzip'
+
+            if not file_path:
+                return
+
+            self.fills = pd.read_csv(file_path, compression=compression)
+            if self.fills.empty:
+                self.fills = None
+                return
+
+            if 'time' in self.fills.columns:
+                self.fills['time'] = pd.to_datetime(self.fills['time'], errors='coerce')
+                if self.fills['time'].isna().all():
+                    self.fills = None
+                return
+
+            if 'minute' in self.fills.columns:
                 timestamp = datetime.datetime.strptime(self.ed, '%Y-%m-%d').timestamp()
-                start_time = timestamp - (self.fills['minute'].iloc[-1] * 60)
+                minute_max = pd.to_numeric(self.fills['minute'], errors='coerce').max()
+                if pd.isna(minute_max):
+                    self.fills = None
+                    return
+                start_time = timestamp - (float(minute_max) * 60)
                 self.fills['time'] = datetime.datetime.fromtimestamp(start_time) + pd.to_timedelta(self.fills['minute'], unit='m')
+                return
+
+            if 'timestamp' in self.fills.columns:
+                ts_num = pd.to_numeric(self.fills['timestamp'], errors='coerce')
+                if ts_num.notna().any():
+                    # Support both seconds and milliseconds
+                    unit = 'ms' if float(ts_num.dropna().iloc[0]) > 1e11 else 's'
+                    self.fills['time'] = pd.to_datetime(ts_num, unit=unit, errors='coerce')
+                    if self.fills['time'].notna().any():
+                        return
+
+            self.fills = None
 
     def view_plot(self):
         # Note: liquidation banner is displayed once above `view_chart_be`
         balance_and_equity = Path(f'{self.result_path}/balance_and_equity.png')
         balance_and_equity_btc = Path(f'{self.result_path}/balance_and_equity_btc.png')
+        balance_and_equity_logy = Path(f'{self.result_path}/balance_and_equity_logy.png')
+        total_wallet_exposure = Path(f'{self.result_path}/total_wallet_exposure.png')
+        pnl_cumsum = Path(f'{self.result_path}/pnl_cumsum.png')
         if balance_and_equity.exists():
             st.image(str(balance_and_equity), width="stretch")
         else:
             st.warning("No balance and equity plot found")
         if balance_and_equity_btc.exists():
             st.image(str(balance_and_equity_btc), width="stretch")
+        if balance_and_equity_logy.exists():
+            st.image(str(balance_and_equity_logy), width="stretch")
+        if total_wallet_exposure.exists():
+            st.image(str(total_wallet_exposure), width="stretch")
+        if pnl_cumsum.exists():
+            st.image(str(pnl_cumsum), width="stretch")
 
     def view_fills(self):
         # Fills are always shown; liquidation banner shown above charts
@@ -1383,6 +1859,7 @@ class BacktestV7Result:
 
     def view(self):
         # Overview: show result/config; liquidation banner is shown above charts
+        self.ensure_config_loaded()
         col1, col2 = st.columns([1,1])
         with col1:
             st.code(json.dumps(self.result, indent=4))
@@ -2011,7 +2488,7 @@ class BacktestV7Results:
                     'Plot': False,
                     'Fills': False,
                     'Backtest Name': result_path,
-                    'Exch.': result.config.backtest.exchanges,
+                    'Exch.': result.exchanges,
                     'Result Time': result.time,
                     'ADG': float(f"{result.adg:.4f}"),
                     'Gain': float(f"{gain:.2f}"),
@@ -2020,8 +2497,8 @@ class BacktestV7Results:
                     'Starting Balance': float(f"{starting_balance_float:.0f}"),
                     'Final Balance': float(f"{final_balance_float:.0f}"),
                     'Final Balance BTC': float(result.final_balance_btc) if result.final_balance_btc is not None else 0,
-                    'TWE': f"{result.config.bot.long.total_wallet_exposure_limit:.2f} / {result.config.bot.short.total_wallet_exposure_limit:.2f}",
-                    'POS': f"{result.config.bot.long.n_positions:.2f} / {result.config.bot.short.n_positions:.2f}",
+                    'TWE': f"{result.twe_long:.2f} / {result.twe_short:.2f}",
+                    'POS': f"{result.pos_long:.2f} / {result.pos_short:.2f}",
                     'index': result,
                 })
         column_config = {
@@ -2073,11 +2550,12 @@ class BacktestV7Results:
             for row in ed["edited_rows"]:
                 if "View" in ed["edited_rows"][row]:
                     if ed["edited_rows"][row]["View"]:
+                        self.results_d[row]["index"].ensure_config_loaded()
                         self.results_d[row]["index"].load_fills()
                         self.results_d[row]["index"].load_be()
                         self.results_d[row]["index"].view_chart_be()
                         self.results_d[row]["index"].view_chart_drawdown()
-                        if self.results_d[row]["index"].config.backtest.btc_collateral_cap > 0:
+                        if self.results_d[row]["index"].btc_collateral_cap > 0:
                             self.results_d[row]["index"].view_chart_be_btc()
                             self.results_d[row]["index"].view_chart_drawdown_btc()
                         self.results_d[row]["index"].view_chart_symbol()
@@ -2136,6 +2614,7 @@ class BacktestV7Results:
             if "Select" in ed["edited_rows"][row]:
                 if ed["edited_rows"][row]["Select"]:
                     sel_result = self.results_d[row]["index"]
+                    sel_result.ensure_config_loaded()
                     st.session_state.v7_strategy_explorer_config = sel_result.config
                     st.session_state.v7_strategy_explorer_config.pbgui.note = f'{sel_result.config.backtest.base_dir.split("/")[-1]}'
 
@@ -2151,6 +2630,7 @@ class BacktestV7Results:
                         st.session_state["se_movie_engine"] = "PB7 fills.csv (from backtest)"
                     except Exception:
                         pass
+                    st.session_state["_bt_v7_main_view_next"] = "Results"
                     st.switch_page(get_navi_paths()["V7_STRATEGY_EXPLORER"])
 
     def optimize_from_result(self):
@@ -2168,6 +2648,7 @@ class BacktestV7Results:
             if "Select" in ed["edited_rows"][row]:
                 if ed["edited_rows"][row]["Select"]:
                     st.session_state.opt_v7 = OptimizeV7.OptimizeV7Item()
+                    self.results_d[row]["index"].ensure_config_loaded()
                     st.session_state.opt_v7.config = self.results_d[row]["index"].config
                     st.session_state.opt_v7.config.pbgui.starting_config = True
                     st.session_state.opt_v7.name = self.results_d[row]["index"].config.backtest.base_dir.split('/')[-1]
@@ -2198,6 +2679,7 @@ class BacktestV7Results:
             if "Select" in ed["edited_rows"][row]:
                 if ed["edited_rows"][row]["Select"]:
                     st.session_state.edit_v7_instance = V7Instance()
+                    self.results_d[row]["index"].ensure_config_loaded()
                     st.session_state.edit_v7_instance.config = self.results_d[row]["index"].config
                     st.session_state.edit_v7_instance.user = st.session_state.edit_v7_instance.config.live.user
                     st.switch_page(get_navi_paths()["V7_RUN"])
@@ -2234,9 +2716,9 @@ class BacktestV7Results:
                             bt_v7.save_queue()
                 if "bt_v7_results" in st.session_state:
                     del st.session_state.bt_v7_results
-                if "config_v7_config_archive" in st.session_state:
-                    del st.session_state.config_v7_config_archive
+                # Keep config_v7_config_archive so returning to Archive tab lands back in the same archive
                 st.session_state.bt_v7_queue = BacktestV7Queue()
+                st.session_state["_bt_v7_main_view_next"] = "Queue"
                 st.rerun()
         with col2:
             if st.button("Cancel"):
@@ -2250,7 +2732,8 @@ class BacktestV7Results:
         if selected_count == 0:
             error_popup("No Backtests selected")
             return
-        if selected_count > 1:
+        # For archive context or multiple selections: use parameter selection form → Queue
+        if selected_count > 1 or "config_v7_config_archive" in st.session_state:
             self.select_parameters(ed)
             return
         for row in ed["edited_rows"]:
@@ -2260,8 +2743,6 @@ class BacktestV7Results:
                     st.session_state.bt_v7.config.backtest.end_date = "now"
                     if "bt_v7_results" in st.session_state:
                         del st.session_state.bt_v7_results
-                    if "config_v7_config_archive" in st.session_state:
-                        del st.session_state.config_v7_config_archive
                     st.rerun()
     
     def calculate_balance(self):
@@ -2278,7 +2759,13 @@ class BacktestV7Results:
         for row in ed["edited_rows"]:
             if "Select" in ed["edited_rows"][row]:
                 if ed["edited_rows"][row]["Select"]:
-                    st.session_state.balance_calc = BalanceCalculator(f'{self.results_d[row]["index"].result_path}/config.json')
+                    config_file = f'{self.results_d[row]["index"].result_path}/config.json'
+                    cfg = ConfigV7(config_file)
+                    cfg.load_config()
+                    st.session_state.bc_context_exchanges = list(cfg.backtest.exchanges or [])
+                    st.session_state.balance_calc = BalanceCalculator(config_file)
+                    # Return to Archive tab if called from archive context, else Results
+                    st.session_state["_bt_v7_main_view_next"] = "Archive" if "config_v7_config_archive" in st.session_state else "Results"
                     st.switch_page(get_navi_paths()["V7_BALANCE_CALC"])
 
     def remove_selected_results(self):
@@ -2333,7 +2820,7 @@ class BacktestV7Results:
                     formatted_time = result.time.strftime("%Y-%m-%d %H:%M:%S")
                     self.compare_fig.add_trace(go.Scatter(x=result.be['time'], y=result.be['equity'], name=f"{name} {formatted_time} equity", line=dict(width=0.75)))
                     self.compare_fig.add_trace(go.Scatter(x=result.be['time'], y=result.be['balance'], name=f"{name} {formatted_time} balance", line=dict(width=2.5)))
-                    if result.config.backtest.btc_collateral_cap > 0:
+                    if result.btc_collateral_cap > 0:
                         name = PurePath(*result.result_path.parts[-3:-2])
                         formatted_time = result.time.strftime("%Y-%m-%d %H:%M:%S")
                         self.compare_fig_btc.add_trace(go.Scatter(x=result.be['time'], y=result.be['equity_btc'], name=f"{name} {formatted_time} equity_btc", line=dict(width=0.75)))
@@ -2439,6 +2926,7 @@ class BacktestsV7:
             if "Select" in ed["edited_rows"][row]:
                 if ed["edited_rows"][row]["Select"]:
                     st.session_state.bt_v7_results = self.d[row]["item"].results
+                    st.session_state["_bt_v7_main_view_next"] = "Results"
                     st.rerun()
 
     def edit_selected(self):
@@ -2465,13 +2953,13 @@ class BacktestsV7:
         col1, col2 = st.columns([1,1])
         with col1:
             if st.button(":green[Yes]"):
+                if "bt_v7_remove_results" in st.session_state and st.session_state.bt_v7_remove_results:
+                    for bt in self.backtests:
+                        bt.results.remove_all_results()
                 rmtree(f'{PBGDIR}/data/bt_v7', ignore_errors=True)
-                if "bt_v7_remove_results" in st.session_state:
-                    if st.session_state.bt_v7_remove_results:
-                        for bt in self.backtests:
-                            bt.results.remove_all_results()
                 self.d = []
                 self.backtests = []
+                st.session_state.pop("bt_v7_results", None)
                 st.rerun()
         with col2:
             if st.button(":red[No]"):
@@ -2485,21 +2973,21 @@ class BacktestsV7:
         if selected_count == 0:
             self.remove_all()
             return
+        remove_results = st.session_state.get("bt_v7_remove_results", False)
         for row in ed["edited_rows"]:
             if "Select" in ed["edited_rows"][row]:
                 if ed["edited_rows"][row]["Select"]:
-                    self.d[row]["item"].remove()
-                    if "bt_v7_remove_results" in st.session_state:
-                        if st.session_state.bt_v7_remove_results:
-                            self.d[row]["item"].results.remove_all_results()
+                    item = self.d[int(row)]["item"]
+                    if remove_results:
+                        item.results.remove_all_results()
+                    item.remove()
         self.d = []
         self.backtests = []
+        # Stay on Configs tab – clear any stale Results session state
+        st.session_state.pop("bt_v7_results", None)
         st.rerun()
 
 def main():
-    # Disable Streamlit Warnings when running directly
-    logging.getLogger("streamlit.runtime.state.session_state_proxy").disabled=True
-    logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").disabled=True
     bt = BacktestV7Queue()
     while True:
         bt.load()
@@ -2513,7 +3001,7 @@ def main():
             if not eval(pb_config.get("backtest_v7", "autostart")):
                 return
             if item.status() == "not started":
-                print(f'{datetime.datetime.now().isoformat(sep=" ", timespec="seconds")} Backtesting {item.filename} started')
+                _log('BacktestV7', f'Backtesting {item.filename} started', level='INFO')
                 item.run()
                 time.sleep(1)
         time.sleep(15)

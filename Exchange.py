@@ -1,6 +1,5 @@
 import ccxt
 import ccxt.pro as ccxt_pro
-import configparser
 from User import User, Users
 from enum import Enum
 import json
@@ -10,6 +9,7 @@ from time import sleep
 from datetime import datetime
 from pbgui_purefunc import PBGDIR
 from logging_helpers import human_log as _human_log
+from logging_helpers import human_log as _log
 
 from ccxt.base.errors import (
     AuthenticationError,
@@ -330,6 +330,17 @@ class Exchange:
                         self.instance.options.setdefault('adjustForTimeDifference', True)
                     except Exception:
                         pass
+                    # HIP-3: Configure Hyperliquid to include stock perpetuals
+                    if self.id == 'hyperliquid':
+                        try:
+                            self.instance.options['fetchMarkets'] = {
+                                'types': ['swap', 'hip3'],
+                                'hip3': {
+                                    'dexes': [],  # Empty = auto-discover all HIP-3 DEXes
+                                }
+                            }
+                        except Exception:
+                            pass
                 except Exception:
                     pass
         except Exception:
@@ -337,14 +348,35 @@ class Exchange:
         if self._user and self.user.key != 'key':
             self.instance.apiKey = self.user.key
             self.instance.secret = self.user.secret
-            self.instance.password = self.user.passphrase
-            self.instance.walletAddress = self.user.wallet_address
-            self.instance.privateKey = self.user.private_key
-        try:
-            self.instance.checkRequiredCredentials()
-        except Exception as e:
-            self.error = (str(e))
-            return
+            if getattr(self.user, 'passphrase', None):
+                self.instance.password = self.user.passphrase
+            if getattr(self.user, 'wallet_address', None):
+                self.instance.walletAddress = self.user.wallet_address
+            if getattr(self.user, 'private_key', None):
+                self.instance.privateKey = self.user.private_key
+
+    def close(self):
+        """Close the exchange instance and release resources (e.g. aiohttp sessions)."""
+        if self.instance and hasattr(self.instance, 'close'):
+            try:
+                # CCXT may use async close() even in sync mode
+                import asyncio
+                import inspect
+                if inspect.iscoroutinefunction(self.instance.close):
+                    # If we're in an event loop, create task; else run_until_complete
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            asyncio.create_task(self.instance.close())
+                        else:
+                            loop.run_until_complete(self.instance.close())
+                    except RuntimeError:
+                        # No event loop available
+                        asyncio.run(self.instance.close())
+                else:
+                    self.instance.close()
+            except Exception as e:
+                _human_log('Exchange', f'Error closing exchange {self.id}: {e}', level='debug')
 
     def create_ws_client(self):
         """Create and return a ccxt.pro client configured for this exchange and user.
@@ -369,6 +401,14 @@ class Exchange:
         try:
             kwargs.setdefault('options', {}).setdefault('recvWindow', 10000)
             kwargs.setdefault('options', {}).setdefault('adjustForTimeDifference', True)
+            # HIP-3: Configure Hyperliquid to include stock perpetuals
+            if ex_id == 'hyperliquid':
+                kwargs.setdefault('options', {})['fetchMarkets'] = {
+                    'types': ['swap', 'hip3'],
+                    'hip3': {
+                        'dexes': [],  # Empty = auto-discover all HIP-3 DEXes
+                    }
+                }
         except Exception:
             pass
 
@@ -421,6 +461,14 @@ class Exchange:
             try:
                 kwargs.setdefault('options', {}).setdefault('recvWindow', 10000)
                 kwargs.setdefault('options', {}).setdefault('adjustForTimeDifference', True)
+                # HIP-3: Configure Hyperliquid to include stock perpetuals
+                if ex_id == 'hyperliquid':
+                    kwargs.setdefault('options', {})['fetchMarkets'] = {
+                        'types': ['swap', 'hip3'],
+                        'hip3': {
+                            'dexes': [],  # Empty = auto-discover all HIP-3 DEXes
+                        }
+                    }
             except Exception:
                 pass
 
@@ -608,6 +656,14 @@ class Exchange:
                 try:
                     kwargs.setdefault('options', {}).setdefault('recvWindow', 10000)
                     kwargs.setdefault('options', {}).setdefault('adjustForTimeDifference', True)
+                    # HIP-3: Configure Hyperliquid to include stock perpetuals
+                    if ex_id == 'hyperliquid':
+                        kwargs.setdefault('options', {})['fetchMarkets'] = {
+                            'types': ['swap', 'hip3'],
+                            'hip3': {
+                                'dexes': [],  # Empty = auto-discover all HIP-3 DEXes
+                            }
+                        }
                 except Exception:
                     pass
 
@@ -818,6 +874,11 @@ class Exchange:
         if not self.instance: self.connect()
         # Fix for Hyperliquid
         if self.id == "hyperliquid":
+            try:
+                if not getattr(self.instance, 'markets', None):
+                    self.instance.load_markets()
+            except Exception:
+                pass
             fetched = self.instance.fetch(
                 "https://api.hyperliquid.xyz/info",
                 method="POST",
@@ -826,11 +887,50 @@ class Exchange:
             )
             prices = {}
             for symbol in symbols:
-                sym = symbol[0:-10]
-                if sym in fetched:
+                base = symbol.split('/')[0] if '/' in symbol else symbol
+                candidates = [base]
+
+                # K-prefix variants (KPEPE -> kPEPE)
+                if base.startswith('K') and len(base) > 1:
+                    candidates.append('k' + base[1:])
+
+                # DEX prefixed symbols (e.g. XYZ-TSLA, FLX-XMR)
+                if '-' in base:
+                    tail = base.split('-', 1)[1]
+                    candidates.append(tail)
+                    prefix = base.split('-', 1)[0].lower()
+                    candidates.append(f"{prefix}:{tail}")
+
+                # Generic case variants
+                candidates.append(base.lower())
+                candidates.append(base.upper())
+
+                last = None
+                for cand in candidates:
+                    if cand in fetched:
+                        last = fetched[cand]
+                        break
+
+                if last is not None:
                     prices[symbol] = {
                         "timestamp": int(datetime.now().timestamp() * 1000),
-                        "last": fetched[sym]
+                        "last": last,
+                    }
+                    continue
+
+                # Fallback to market metadata prices (available for HIP-3 and
+                # some builder DEX symbols not keyed in allMids).
+                market = None
+                try:
+                    market = self.instance.market(symbol)
+                except Exception:
+                    market = None
+                info = (market or {}).get('info', {}) if market else {}
+                md_price = info.get('markPx') or info.get('midPx') or info.get('oraclePx')
+                if md_price is not None:
+                    prices[symbol] = {
+                        "timestamp": int(datetime.now().timestamp() * 1000),
+                        "last": md_price,
                     }
         else:
             prices = self.instance.fetch_tickers(symbols=symbols)
@@ -973,14 +1073,14 @@ class Exchange:
                     last_trade = trades[-1]
                     all_histories = trades + all_histories
                 if len(trades) == limit:
-                    print(f'User:{self.user.name} Fetched', len(trades), 'trades from', self.instance.iso8601(first_trade['timestamp']), 'till', self.instance.iso8601(last_trade['timestamp']))
+                    _log('Exchange', f'User:{self.user.name} Fetched {len(trades)} trades from {self.instance.iso8601(first_trade["timestamp"])} till {self.instance.iso8601(last_trade["timestamp"])}', level='DEBUG')
                     end = trades[0]['timestamp']
                 else:
-                    print(f'User:{self.user.name} Fetched', len(trades), 'trades from', self.instance.iso8601(since), 'till', self.instance.iso8601(end))
+                    _log('Exchange', f'User:{self.user.name} Fetched {len(trades)} trades from {self.instance.iso8601(since)} till {self.instance.iso8601(end)}', level='DEBUG')
                     since = since + week
                     end = since + week
                 if since > now:
-                    print(f'User:{self.user.name} Done')
+                    _log('Exchange', f'User:{self.user.name} Done', level='DEBUG')
                     break
             for history in all_histories:
                 income = {}
@@ -2745,16 +2845,19 @@ class Exchange:
         cpSymbols = []
         if self.id == 'binance':
             users = Users()
-            self.user = users.find_binance_user()
-            if self.user:
-                self.connect()
-                try:
-                    symbols = self.instance.sapiGetCopytradingFuturesLeadsymbol()
-                except Exception as e:
-                    _human_log('Exchange', f'Error: {e}', level='ERROR', user=self.user)
-                    return
-                for symbol in symbols["data"]:
-                    cpSymbols.append(symbol["symbol"])
+            all_users = users.find_binance_users()
+            if all_users:
+                for user in all_users:
+                    self.user = user
+                    self.connect()
+                    try:
+                        symbols = self.instance.sapiGetCopytradingFuturesLeadsymbol()
+                        if symbols and symbols.get("data"):
+                            for symbol in symbols["data"]:
+                                cpSymbols.append(symbol["symbol"])
+                            break
+                    except Exception as e:
+                        _human_log('Exchange', f'User:{self.user.name} Error: {e}', level='ERROR', user=self.user)
         elif self.id == 'bybit':
             # print(self.instance.__dir__())
             symbols = self.instance.publicGetContractV3PublicCopytradingSymbolList()
@@ -2775,7 +2878,7 @@ class Exchange:
                                 cpSymbols.append(symbol["symbol"])
                             break
                     except Exception as e:
-                        print(f'User:{self.user.name} Error:', e)
+                        _log('Exchange', f'User:{self.user.name} Error: {e}', level='ERROR')
         cpSymbols.sort()
         return cpSymbols
 
@@ -2788,6 +2891,10 @@ class Exchange:
         for (k,v) in list(self._markets.items()):
             if v["swap"] and v["active"] and v["linear"]:
                 if self.id == "hyperliquid":
+                    # Skip HIP-3 stock perpetuals — only regular crypto swaps belong in ini
+                    info = v.get("info", {})
+                    if isinstance(info, dict) and info.get("hip3"):
+                        continue
                     if v["symbol"].endswith('USDC'):
                         self.swap.append(v["symbol"][0:-5].replace("/", "").replace("-", ""))
                 if self.id == "bitget":
@@ -2824,33 +2931,34 @@ class Exchange:
         self.swap.sort()
         if self.cpt:
             self.cpt.sort()
-        # print(self.spot)
-        # print(self.swap)
-        # print(self.cpt)
-        self.save_symbols()
-
-    def save_symbols(self):
-        pb_config = configparser.ConfigParser()
-        pb_config.read('pbgui.ini')
-        if not pb_config.has_section("exchanges"):
-            pb_config.add_section("exchanges")
-        pb_config.set("exchanges", f'{self.id}.swap', f'{self.swap}')
-        if self.spot:
-            pb_config.set("exchanges", f'{self.id}.spot', f'{self.spot}')
-        if self.cpt:
-            pb_config.set("exchanges", f'{self.id}.cpt', f'{self.cpt}')
-        with open('pbgui.ini', 'w') as f:
-            pb_config.write(f)
 
     def load_symbols(self):
-        pb_config = configparser.ConfigParser()
-        pb_config.read('pbgui.ini')
-        if pb_config.has_option("exchanges", f'{self.id}.spot'):
-            self.spot = eval(pb_config.get("exchanges", f'{self.id}.spot'))
-        if pb_config.has_option("exchanges", f'{self.id}.swap'):
-            self.swap = eval(pb_config.get("exchanges", f'{self.id}.swap'))
-        if not self.spot and not self.swap:
-            self.fetch_symbols()
+        self.spot = []
+        self.swap = []
+        self.cpt = []
+
+        mapping_path = Path.cwd() / "data" / "coindata" / str(self.id).lower() / "mapping.json"
+        if mapping_path.exists():
+            try:
+                mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+                for row in mapping if isinstance(mapping, list) else []:
+                    symbol = str(row.get("symbol") or "").strip().upper()
+                    if not symbol:
+                        continue
+                    if bool(row.get("swap", False)) and bool(row.get("active", True)) and bool(row.get("linear", True)):
+                        self.swap.append(symbol)
+                        if bool(row.get("copy_trading", False)):
+                            self.cpt.append(symbol)
+                    if bool(row.get("spot", False)) and bool(row.get("active", True)) and self.id in ["bybit", "binance"]:
+                        self.spot.append(symbol)
+            except Exception:
+                self.spot = []
+                self.swap = []
+                self.cpt = []
+
+        self.spot = sorted(set(self.spot))
+        self.swap = sorted(set(self.swap))
+        self.cpt = sorted(set(self.cpt))
     
     def fetch_symbol_infos(self, symbol: str):
         if not self.instance:
@@ -2899,76 +3007,4 @@ class Exchange:
             # print(symbol, we, min_price, balance_needed_symbol)
         return balance_needed
 
-            
-def main():
-    print("Don't Run this Class from CLI")
-    # exchange = Exchange("gateio", None)
-    # exchange.fetch_symbols()
-    # print(exchange.swap)
-    # users = Users()
-    # exchange = Exchange("bitget", users.find_user("bitget_CPT"))
-    # exchange.fetch_symbols()
-    # print(exchange.fetch_copytrading_symbols())
-    # exchange = Exchange("hyperliquid", users.find_user("hl_HYPErQuantum"))
-    # print(exchange.fetch_prices(["DOGE/USDC:USDC", "WIF/USDC:USDC"], "swap"))
-    # exchange = Exchange("binance", users.find_user("binance_CPT"))
-    # exchange = Exchange("bybit", users.find_user("HYPErQuantum"))
-    # exchange = Exchange("hyperliquid", users.find_user("hl_mani05_DOGE"))
-    # exchange = Exchange("bitget", users.find_user("bitget_HYPErQuantum"))
-    # exchange = Exchange("okx", users.find_user("okx_MAINCPT"))
-    # symbols = ["BTCUSDT"]
-    # symbols = ["DOGEUSDT", "VETUSDT", "ICPUSDT", "INJUSDT"]
-    # exchange = Exchange("hyperliquid", None)
-    # balance_needed = exchange.calculate_balance_needed(symbols, 12.0, 0.03215)
-    # print(f'Balance needed on {exchange.id} for {symbols} is {balance_needed:.2f} USDC')
-    # exchange = Exchange("okx", None)
-    # balance_needed = exchange.calculate_balance_needed(symbols, 12.0, 0.03215)
-    # print(f'Balance needed on {exchange.id} for {symbols} is {balance_needed:.2f} USDT')
-    # exchange = Exchange("binance", None)
-    # balance_needed = exchange.calculate_balance_needed(symbols, 12.0, 0.03215)
-    # print(f'Balance needed on {exchange.id} for {symbols} is {balance_needed:.2f} USDT')
-    # exchange = Exchange("bybit", None)
-    # balance_needed = exchange.calculate_balance_needed(symbols, 12.0, 0.03215)
-    # print(f'Balance needed on {exchange.id} for {symbols} is {balance_needed:.2f} USDT')
-    # exchange = Exchange("bitget", None)
-    # balance_needed = exchange.calculate_balance_needed(symbols, 12.0, 0.03215)
-    # print(f'Balance needed on {exchange.id} for {symbols} is {balance_needed:.2f} USDT')
-    # exchange = Exchange("gateio", None)
-    # balance_needed = exchange.calculate_balance_needed(symbols, 12.0, 0.03215)
-    # print(f'Balance needed on {exchange.id} for {symbols} is {balance_needed:.2f} USDT')
-    # exchange.load_market()
-    # exchange.fetch_symbol_min_order_price("BTCUSDT")
-    # exchange.fetch_symbol_min_order_price("ETHUSDT")
-    # exchange.fetch_symbol_min_order_price("SOLUSDT")
-    # exchange.fetch_symbol_min_order_price("DOGEUSDT")
-    # save markets as json
-    # with open('binance_markets.json', 'w') as f:
-    #     json.dump(exchange._markets, f, indent=4)
-    
 
-    # exchange.fetch_symbols()
-    # print(exchange.fetch_copytrading_symbols())
-    # exchange = Exchange("bybit", users.find_user("bybit_CPTV7HR"))
-    # print(exchange.fetch_balance("swap"))
-    # exchange.fetch_symbols()
-    # exchange = Exchange("okx", users.find_user("okx_MAINCPT"))
-    # exchange.fetch_symbols()
-    # print(allowed_symbols)
-    # print(exchange.swap)
-    # print(exchange.fetch_positions())
-    # print(exchange.fetch_all_open_orders("DOGE/USDC:USDC"))
-    # print(exchange.fetch_prices(["DOGE/USDC:USDC"], "swap"))
-    # print(exchange.fetch_prices(["DOGE/USDT:USDT", "WIF/USDT:USDT"], "swap"))
-    # print(exchange.fetch_balance("swap"))
-
-    # print(exchange.symbol_to_exchange_symbol("BTCUSDC", "swap"))
-    # print(exchange.fetch_symbol_info("DOGEUSDC", "swap"))
-    # print(exchange.fetch_price("DOGE/USDC:USDC", "swap"))
-    # exchange.fetch_symbols()
-    # spot = exchange.fetch_spot()
-    # print(exchange.fetch_history(1749323083834))
-    # print(exchange.fetch_balance("swap"))
-    # print(spot)
-
-if __name__ == '__main__':
-    main()

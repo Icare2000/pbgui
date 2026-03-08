@@ -71,6 +71,30 @@ def load_ini(section : str, parameter : str):
     else:
         return ""
 
+
+def migrate_ini_sections():
+    """One-time migration: rename [pbmaster] → [vps_monitor], [pbmaster_ui] → [vps_monitor_ui].
+
+    Preserves all existing keys. Safe to call multiple times (no-op if already migrated).
+    Called once at application startup.
+    """
+    ini_path = Path("pbgui.ini")
+    if not ini_path.exists():
+        return
+    cfg = configparser.ConfigParser()
+    cfg.read(str(ini_path))
+    changed = False
+    for old, new in [("pbmaster", "vps_monitor"), ("pbmaster_ui", "vps_monitor_ui")]:
+        if cfg.has_section(old) and not cfg.has_section(new):
+            cfg.add_section(new)
+            for key, val in cfg.items(old):
+                cfg.set(new, key, val)
+            cfg.remove_section(old)
+            changed = True
+    if changed:
+        with open(str(ini_path), "w") as f:
+            cfg.write(f)
+
 def pbdir(): return load_ini("main", "pbdir")
 
 def pbvenv(): return load_ini("main", "pbvenv")
@@ -202,16 +226,15 @@ def compute_pb7_entry_gating_ohlcv_df(
             yield cur
             cur = cur + timedelta(days=1)
 
-    arrays = []
-    for cand_ex in exchange_candidates:
-        base = (
-            Path(pb7_root)
-            / "historical_data"
-            / f"ohlcvs_{cand_ex}"
-            / coin
-        )
+    # Determine ohlcv_source_dir from backtest config (if set)
+    backtest_cfg = (cfg or {}).get("backtest", {}) if isinstance(cfg, dict) else {}
+    ohlcv_source_dir = str(backtest_cfg.get("ohlcv_source_dir") or "").strip() or None
+
+    def _load_npy_dir(base: Path) -> list:
+        """Load YYYY-MM-DD.npy files from a directory."""
+        out = []
         if not base.exists():
-            continue
+            return out
         for d in daterange(start_day, end_day):
             p = base / f"{d.isoformat()}.npy"
             if not p.exists():
@@ -220,15 +243,98 @@ def compute_pb7_entry_gating_ohlcv_df(
                 a = np.load(p)
                 if a is None or getattr(a, "size", 0) == 0:
                     continue
-                arrays.append(a)
+                out.append(a)
             except Exception:
                 continue
-        if arrays:
-            break
+        return out
+
+    def _load_npz_dir(base: Path) -> list:
+        """Load YYYY-MM-DD.npz (PBGui format) from a directory."""
+        out = []
+        if not base.exists():
+            return out
+        for d in daterange(start_day, end_day):
+            p = base / f"{d.isoformat()}.npz"
+            if not p.exists():
+                continue
+            try:
+                z = np.load(p)
+                candles = z.get("candles")
+                if candles is None or getattr(candles, "size", 0) == 0:
+                    continue
+                plain = np.column_stack([
+                    candles["ts"].astype("int64"),
+                    candles["o"].astype(float),
+                    candles["h"].astype(float),
+                    candles["l"].astype(float),
+                    candles["c"].astype(float),
+                ])
+                out.append(plain)
+            except Exception:
+                continue
+        return out
+
+    # Build candidate coin directory names for PBGui npz format
+    pbgui_coin_dirs = [f"{coin}_USDC:USDC"]
+    if coin.upper() not in ("USDC", "USDT"):
+        pbgui_coin_dirs.append(f"{coin}_USDT:USDT")
+
+    arrays = []
+    searched_paths: list[str] = []
+
+    # --- 1) If ohlcv_source_dir is set in config, search ONLY there ---
+    if ohlcv_source_dir:
+        src_root = Path(ohlcv_source_dir)
+        for cand_ex in exchange_candidates:
+            # PBGui layout: <ohlcv_source_dir>/<exchange>/1m/<COIN_USDC:USDC>/YYYY-MM-DD.npz
+            for coin_dir_name in pbgui_coin_dirs:
+                base = src_root / cand_ex / "1m" / coin_dir_name
+                searched_paths.append(str(base))
+                arrays = _load_npz_dir(base)
+                if arrays:
+                    break
+            if arrays:
+                break
+            # Also try npy layout: <ohlcv_source_dir>/<exchange>/<coin>/YYYY-MM-DD.npy
+            if not arrays:
+                base = src_root / cand_ex / coin
+                searched_paths.append(str(base))
+                arrays = _load_npy_dir(base)
+                if arrays:
+                    break
+
+        if not arrays:
+            raise FileNotFoundError(
+                f"No OHLCV data found for {coin} in configured backtest.ohlcv_source_dir={src_root} "
+                f"(searched: {', '.join(searched_paths[:6])})"
+            )
+
+    # --- 2) PB7 historical_data fallback (only when no explicit source dir) ---
+    if not arrays and not ohlcv_source_dir:
+        for cand_ex in exchange_candidates:
+            base = Path(pb7_root) / "historical_data" / f"ohlcvs_{cand_ex}" / coin
+            searched_paths.append(str(base))
+            arrays = _load_npy_dir(base)
+            if arrays:
+                break
+
+    # --- 3) PBGui default data/ohlcv fallback (only when no explicit source dir) ---
+    if not arrays and not ohlcv_source_dir:
+        pbgui_root = Path(__file__).resolve().parent
+        for cand_ex in exchange_candidates:
+            for coin_dir_name in pbgui_coin_dirs:
+                base = pbgui_root / "data" / "ohlcv" / cand_ex / "1m" / coin_dir_name
+                searched_paths.append(str(base))
+                arrays = _load_npz_dir(base)
+                if arrays:
+                    break
+            if arrays:
+                break
 
     if not arrays:
         raise FileNotFoundError(
-            f"No OHLCV npy found for {coin} on {exchange_candidates} in pb7 historical_data"
+            f"No OHLCV data found for {coin} on {exchange_candidates} "
+            f"(searched: {', '.join(searched_paths[:6])})"
         )
 
     arr = np.vstack(arrays)
@@ -342,12 +448,34 @@ def config_pretty_str(config: dict):
         return pretty_str
 
 def load_symbols_from_ini(exchange: str, market_type: str):
-    pb_config = configparser.ConfigParser()
-    pb_config.read('pbgui.ini')
-    if pb_config.has_option("exchanges", f'{exchange}.{market_type}'):
-        return eval(pb_config.get("exchanges", f'{exchange}.{market_type}'))
-    else:
+    exchange = str(exchange or "").strip().lower()
+    market_type = str(market_type or "").strip().lower()
+
+    mapping_path = Path.cwd() / "data" / "coindata" / exchange / "mapping.json"
+    if not mapping_path.exists():
         return []
+
+    try:
+        mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+    symbols = []
+    for row in mapping if isinstance(mapping, list) else []:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        if market_type == "swap":
+            if bool(row.get("swap", False)) and bool(row.get("active", True)) and bool(row.get("linear", True)):
+                symbols.append(symbol)
+        elif market_type == "spot":
+            if bool(row.get("spot", False)) and bool(row.get("active", True)):
+                symbols.append(symbol)
+        elif market_type == "cpt":
+            if bool(row.get("swap", False)) and bool(row.get("copy_trading", False)) and bool(row.get("active", True)):
+                symbols.append(symbol)
+
+    return sorted(set(symbols))
 
 
 def list_remote_git_branches(remote_url: str, timeout_sec: int = 20) -> list[str]:
@@ -463,6 +591,18 @@ def pb7_suite_preflight_errors(config: dict) -> list[str]:
     if include_base:
         return []
 
+    def _has_any_coins(value) -> bool:
+        if isinstance(value, dict):
+            return any(_has_any_coins(v) for v in value.values())
+        if isinstance(value, (list, tuple, set)):
+            return any(str(x).strip() for x in value if x is not None)
+        if isinstance(value, str):
+            return bool(value.strip())
+        return False
+
+    live_section = config.get("live") or {}
+    has_base_approved = _has_any_coins(live_section.get("approved_coins"))
+
     base_coin_sources = backtest.get("coin_sources") or {}
     has_base_coin_sources = isinstance(base_coin_sources, dict) and any(
         v is not None and str(v).strip() for v in base_coin_sources.values()
@@ -486,7 +626,12 @@ def pb7_suite_preflight_errors(config: dict) -> list[str]:
         ):
             has_any_scenario_coin_sources = True
 
-    if not (has_base_coin_sources or has_any_scenario_coins or has_any_scenario_coin_sources):
+    if not (
+        has_base_coin_sources
+        or has_any_scenario_coins
+        or has_any_scenario_coin_sources
+        or has_base_approved
+    ):
         errors.append(
             "Suite is enabled with include_base_scenario=false, but no coins are defined in any scenario "
             "(and no coin_sources are set). PB7 will build an empty master coin list and fail with "

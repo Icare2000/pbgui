@@ -7,7 +7,7 @@
 I offer API-Service where I run passivbot for you as a Service.
 Just contact me on Telegram for more information.
 
-# v1.53
+# v1.66
 
 ### Overview
 Passivbot GUI (pbgui) is a WEB Interface for Passivbot programed in python with streamlit
@@ -27,7 +27,7 @@ It has the following functions:
 ### Requirements
 - Python 3.12 (default)
 - Python 3.10 (only required if you use PB6)
-- Streamlit 1.52.0
+- Streamlit 1.54.0
 - Linux
 
 ### Migration (Python 3.10 -> 3.12)
@@ -322,6 +322,195 @@ Edit pbguipath in the start.bat to your pbgui installation path
 Add start.bat to Windows Task Scheduler and use Trigger "At system startup"
 
 # Changelog
+
+## v1.66 (07-03-2026)
+- Fix: Market data loop timer accuracy — fetch interval now correctly excludes processing time; all 3 exchange loops (HL, Binance, Bybit) subtract elapsed fetch duration so the next cycle starts on schedule
+- Fix: PBData debounce flusher — `AuthenticationError` (e.g. missing Bitget passphrase) is now dropped immediately with a single log entry instead of retrying for 30 s
+- Fix: `Exchange.connect()` now correctly supplies `passphrase`, `walletAddress`, and `privateKey` to the CCXT instance; previously these were assigned after `close()` (dead code with no effect), causing "requires password credential" errors for Bitget and "requires walletAddress" errors for Hyperliquid REST calls
+- Improved: PBData service page — Log viewer and Fetch Status separated into tabs (📋 Log / 📊 Status) to eliminate visual overlap
+- Fix: Heatmap WebSocket — `verify_token` import error fixed (`validate_token`); heatmap live updates and "Offline" indicator now work correctly
+- Improved: Heatmap — silent background updates via `Plotly.react()` instead of full chart rebuild; no more flicker on live data changes
+- Improved: Heatmap — WebSocket updates debounced (1s quiet period) to avoid redundant reloads during batch conversions
+- Improved: Heatmap — `overflow: hidden` on chart containers prevents scrollbar-triggered layout jitter
+- Improved: Job Monitor — active jobs sorted newest-first (running before pending, then by update time descending)
+- Improved: Job Monitor — timestamps displayed as readable dates (`2026-03-06 18:36:01`) instead of raw Unix timestamps
+- Improved: Job Monitor — `job_type` filter parameter added; Download and Build sections now show only their own jobs instead of all jobs for the exchange
+- Improved: VPS Monitor — mass-disconnect detection: when ≥50% of hosts disconnect simultaneously (network blip), a single batched Telegram alert is sent instead of one per host; same for reconnect
+
+## v1.65 (03-06-2026)
+- **Important:** Firewall setup now opens port 8000 (API Server) for VPN clients. If you installed your VPS with our setup scripts before this change, the Log Viewer and WebSocket features will not work over VPN. **Fix:** Pull the latest code and re-run the firewall script on each VPS:
+  ```
+  cd ~/pbgui && git pull
+  sudo bash setup/setup_firewall.sh -i <your_ssh_ips>
+  ```
+- New: PBMaster replaced by async FastAPI backend — all VPS monitoring, SSH connections, and WebSocket streaming now run inside the API Server (port 8000). The new server uses **asyncssh** (now a hard dependency) instead of Paramiko; the separate PBMaster daemon (port 8765) has been removed
+- New: VPS Monitor powered by `/ws/vps` WebSocket endpoint — live host metrics, service state, instance collection, log streaming, and service restart all via a single multiplexed connection
+- New: INI sections auto-migrated on first startup (`[pbmaster]` → `[vps_monitor]`, `[pbmaster_ui]` → `[vps_monitor_ui]`)
+- New: FastAPI `/docs` enriched with version, description, WebSocket protocol documentation, and OpenAPI tags
+- Improved: Log viewer connects to API Server WebSocket instead of old PBMaster port; banner updated accordingly
+- Improved: Duplicate log lines in VPS Monitor Live Logs fixed (`tail -f -n 0` + buffer drain)
+- Improved: API Server PID file now written correctly when started manually
+- Improved: Uvicorn log output bridged to `human_log()` via custom handler; no more raw stdout logging
+- Removed: 11 dead code files (PBMaster.py, master/ws_server.py, master/ipc_server.py, master/ipc_client.py, master/status_file.py, master/connection_pool.py, master/log_streamer.py, master/service_monitor.py, master/realtime_collector.py, master/command_executor.py, tests/test_pbmaster.py)
+- Fix: L2Book inventory now includes files archived to NAS — coins that were fully moved to the archive directory no longer show 0 files / 0 MB
+- Market Data/Heatmap: months with no l2Book data are now displayed as red "missing" blocks, with a legend added for l2Book coverage. The month selector and info endpoint include months through the current month even when empty.
+- Heatmap overview chart gains a “Download missing” button which queues a background job to fetch l2Book data from the day after the last present file through today. The download API now accepts explicit start/end dates (YYYYMMDD) in addition to a single month.
+- Fix: Job files now survive hard system crashes — `fsync` added to atomic JSON write ensures bytes hit disk before rename
+- Fix: Worker startup now requeues all interrupted jobs unconditionally (previously only jobs older than 1h were requeued; actively-running jobs whose progress file was recently updated were silently lost)
+- Fix: Job status field corrected to `pending` when requeueing (was left as `running` in the JSON content)
+- Improved: Requeue at startup is now logged with job name and age so crashes are visible in MarketData.log
+- Fix: Binance Build best 1m — Stop button now cancels within seconds during ZIP download; downloads now use streaming + per-chunk stop_check instead of blocking until full file received
+- Improved: Binance Build best 1m — archive probing phase now starts from inception month instead of 2019-01; eliminates up to ~80 redundant HEAD requests for recently-listed coins (e.g. ~1 min → < 1 sec)
+- Fix: Market Data — Exchange selector no longer jumps back to Hyperliquid after Stop button triggers a page rerun; session state is now pre-initialised once on first visit so subsequent reruns always preserve the user's selection
+- Improved: Market Data — new high‑speed OHLCV downloader for Binance and Bybit 1m feeds (public.bybit.com + CCXT), dramatically reducing overall download time and avoiding rate‑limit delays
+- Improved: VPS host picker converted to multiselect with All/None buttons; save button moved into the sidebar for all services for consistency
+- Fixed: PBRemote monitor settings save button relocated to sidebar to avoid being obscured by the dropdown
+
+## v1.64 (03-03-2026)
+- Improved: Market Data — job worker now runs different job types in parallel (one thread per type); e.g. Hyperliquid 1m, Binance 1m, and L2Book downloads can run simultaneously instead of sequentially
+- Improved: Market Data — inventory cache is now read-only in the UI; background task workers push updates per coin after each download, eliminating UI blocking during data fetch
+- New: Market Data — `sweep_cache_mtimes()` + 10-minute background sweep thread to detect external file changes and refresh the inventory cache automatically
+- Fix: Market Data — double-render of job panels removed; Stop/Log action buttons rendered outside auto-refresh fragment to prevent lost clicks; Running expander placed before Pending/Failed/Done expanders; `StreamlitAPIException` fixed via pending-key pattern for segmented-control navigation
+- Improved: Replace deprecated `use_container_width=True` with `width='stretch'` across all pages
+
+## v1.63 (02-03-2026)
+- Improved: VPS Manager — API sync indicator replaced with colored status button (🔴 / 🟢) matching the API Keys page, with live progress counter and toast notification
+- New: PBv7 Backtest — 5 top-level tabs: Configs | Queue | Log | Results | Archive; Log tab with a dedicated streaming viewer that starts before the backtest begins
+- New: PBv7 Backtest guide (EN + DE) covering all 5 tabs, typical workflows, and sidebar actions
+- Improved: PBv7 Backtest log path migrated from `data/bt_v7_queue/` to `data/logs/backtests/`; existing log files renamed automatically on first view
+- Fix: PBCoinData crash (`TypeError`) when exchange is not configured — `load_mapping` and `get_mapping_tags` now return early on `None` exchange
+- New: PBv7 Optimize — 4 top-level tabs: Config | Queue | Log | Results; Log tab with streaming viewer (replaces inline per-job log); optimize log path migrated to `data/logs/optimizes/`
+- New: PBv7 Optimize guide (EN + DE) covering all 4 tabs, typical workflows, and sidebar actions
+- New: PBv7 Run guide (EN + DE) covering instance list, edit form, status icons, and typical workflows
+- New: VPS Manager guide (EN + DE) covering overview table, Master/VPS management, branch switching, and add-VPS wizard
+- New: Dashboard guide (EN + DE) covering view, create, and edit workflows
+- New: Per-job log files (`data/logs/jobs/`) — each task worker job writes its own timestamped log with per-coin progress, stage transitions, errors, and summary
+- New: "Log" button on all job rows (Running/Done/Failed/Pending) — switches to Activity Log tab and opens the job's log in the streaming viewer; jobs subdir excluded from sidebar to prevent flooding
+- New: "Rerun" button for Done jobs — re-queues a completed job with the same payload while preserving history
+- Fix: Binance 1m daily ZIP fallback — when monthly archive ZIP is not yet published (e.g. on the 1st of a new month), each day of the month is fetched individually from the daily archive
+- Improved: Live log viewer with WebSocket streaming — real-time log tailing in the UI without page reload
+- Improved: Log viewer rotation settings moved to separate view; full-height display by default; log file list injected from Python (no PBMaster restart required)
+- Improved: PBRemote sidebar — server list with status colors, API sync status button with live polling, per-server tooltips showing instance counts
+- Improved: API Keys editor — API sync button with live polling loop
+- Improved: Compact layout CSS applied globally — consistent padding and heading margins across all pages
+- Improved: Full logging migration — all GUI modules now use `human_log` exclusively; no more `print()`, `logging.xxx()`, or `traceback.print_exc()` in GUI code
+- Improved: 3-tier log routing via `LOG_GROUPS` in `logging_helpers.py` — 13 GUI helper classes consolidated into `PBGui.log`; daemon and data-pipeline services keep their own log files
+- Improved: Logging guide updated with "Where to find what" table — users can quickly look up which log file contains messages for each component
+- Fix: PBRemote — 10 stability fixes (file handle leaks, UnboundLocalErrors, atomic API key writes, list mutation during iteration, infinite recursion in `__next__`, corrupt JSON crash in sync loop)
+- Fix: VPS branch switch playbooks — use `git reset --hard` instead of `git pull` to handle divergent branches (e.g. after PR merge)
+- Improved: Pareto Explorer — sidebar navigation replaced with segmented-control tabs (Command Center / Pareto Playground / Deep Intelligence) matching Backtest and Optimize; oversized stage titles removed; 📖 Guide button added (EN + DE)
+- New: Balance Calculator — 📖 Guide button added (EN + DE)
+
+## v1.62 (01-03-2026)
+- New: Binance USDM full historical 1m OHLCV backfill — inception-to-today via official monthly/daily archive ZIPs (data.binance.vision) with CCXT gap-fill; same NPZ format as PB7 cache
+- New: Task worker job type `binance_best_1m` with per-coin progress, cancel support, and chunk tracking
+- New: Market Data jobs panel — Pending/Failed/Done lists with selectable rows, bulk delete, retry failed, raw JSON inspection
+- New: `PB7 cache` tab shows interactive OHLCV chart when a row is selected
+- New: "Select all" / "Clear all" buttons for enabled-coins multiselect (Hyperliquid and Binance)
+- New: "Run now", "Cancel queued" and "Stop current run" buttons for latest 1m refresh cycles (Hyperliquid and Binance)
+- Improved: Status expanders auto-refresh every 5s with per-coin progress bar
+- Improved: PBData restart respects remaining cycle interval; mid-cycle crash resumes from last completed coin
+- Improved: Market Data "Already have" table ~10ms warm load via persistent SQLite inventory cache
+- Fix: PBMaster no longer sends false-positive "service down" alerts on transient SSH errors
+- Fix: PNL Today/Yesterday showed 0 for PB7 instances after bot restart
+
+## v1.61 (27-02-2026)
+- New: PBMaster SSH-based VPS management service — persistent SSH connections to all configured VPS nodes with centralized command execution, service monitoring, and real-time log streaming
+- New: VPS Monitor real-time dashboard — WebSocket-powered HTML component with live host status, service restart, and interactive log viewer
+- New: VPS Monitor log viewer features: real file line numbers, block collapse/expand, full-text search with highlighting, auto-scroll, live streaming mode, and compact display option
+- New: PBMaster integrated in Services UI with toggle, settings, and connection status indicator
+- Improved: PBMaster worker crash resilience — auto-restart on failure, stop_check pattern, robust main loop
+- Improved: Session ID tracking prevents duplicate log lines on rapid host/service switching
+- Improved: Compact mode display setting persisted in pbgui.ini
+- Fix: Removed spurious console warning about obsolete limit metric `equity_balance_diff_mean`
+- Fix: Streamlit empty label warning in Services page segmented control
+- Improved: Build best 1m worker stability — robust main loop with auto-restart on crash, graceful stop via `stop_check` through entire Tiingo pipeline (rate-limit waits, IEX, FX), dead worker auto-detection in UI
+- Updated: Streamlit 1.54.0, websockets 16.0, paramiko 4.0.0
+
+## v1.60 (25-02-2026)
+- Fix: OHLCV chart no longer shows stock split lines outside the actual data range (e.g. AMZN splits from 1998 without OHLCV data)
+- Fix: Market Data "Already have" 1m tab now shows all coins (removed hard limit of 200 that cut off alphabetically later entries like NVDA, ORCL)
+- Fix: TradFi XYZ spec fetch now only runs on master (skipped on slave VPS nodes to avoid bs4 dependency warning)
+- Fix: Balance Calculator now works for XYZ stock-perp coins (normalized coin format mismatch between PB7 config `xyz:AAPL` and mapping `XYZ-AAPL`)
+
+## v1.59 (25-02-2026)
+- New: Interactive OHLCV chart in Market Data minute view — built as a bidirectional Streamlit component with Plotly.js for fast visual data validation and spotting gaps or anomalies in 1m builds
+- The chart uses lazy auto-zoom: starts with daily candles when fully zoomed out and automatically switches to finer timeframes (1h → 15m → 5m → 1m) as you zoom in — no manual controls needed
+- Coin name displayed in the top-left corner, volume bars always shown
+- For equity stock-perps: historical stock split dates shown as vertical dashed orange lines with annotations (e.g. "Split 20:1"); OHLCV data automatically adjusted for splits using Tiingo Daily API
+- Split factor data stored per exchange in `data/coindata/hyperliquid/split_factors.json`
+- New: Market Data stock-perp minute view now includes toggles to disable `market holiday` and `expected out-of-session gap` overlays, so raw missing gaps can be inspected directly
+- Docs: Market Data guides updated (EN/DE)
+
+## v1.58 (23-02-2026)
+- Improved: TradFi Build best 1m backfill now runs newest→oldest for both FX (weekly chunks) and equities (monthly chunks), with stop after consecutive empty periods to reduce Tiingo credit usage
+- Improved: TradFi stock-perp start handling now honors mapped `tiingo_start_date` (or IEX floor) for consistent first-run style backfill behavior
+- Improved: Tiingo quota wait status now updates as a live countdown in job progress instead of a static wait value
+- Fix: US market holiday/early-close session handling added to TradFi 1m fill logic to avoid unnecessary requests and false gaps on closed periods
+- Fix: Market Data `missing_minutes` / `coverage_pct` for TradFi 1m now use expected in-session minutes (holiday/early-close + current-day cutoff), preventing false missing counts
+- Improved: `Build best 1m` now includes optional `End date` (in addition to optional `Start date`) to run bounded backfills (e.g. one month only)
+- Improved: TradFi stock-perp backfill cursor now anchors on existing `other_exchange` history (same behavior pattern for FX and equities), while `refetch` still forces rebuild from the selected end
+- Improved: FX weekend handling now uses explicit UTC session boundaries (Fri close/Sun reopen) and marks closed windows as expected out-of-session gaps in heatmaps
+- Fix: FX holiday session model now handles year-end reduced windows (`12-24`/`12-31` early close around 22:00 UTC, `12-25`/`01-01` late reopen around 23:00 UTC), avoiding false missing blocks at day boundaries
+- Improved: Minute heatmap now preserves real source colors (`api`/`other_exchange`/etc.) even outside expected session; out-of-session/holiday markers apply only to truly missing minutes
+- Improved: Equity (IEX) TradFi write path now uses raw-first ingestion (write all minutes returned by Tiingo) without additional market-hours clipping
+- Improved: Market Data `TradFi Symbol Mappings` table now supports filter controls for symbol, type, and status (ordered as symbol → type → status)
+- Improved: Market Data `Already have` tabs (`1m`, `1m_api`, `l2Book`) now include coin/type filters, summary cards (`coins/files/size`), and hide redundant context columns (`exchange`, `dataset`)
+- Improved: Market Data `PB7 cache` table now includes coin/type filters, hides redundant `exchange`, and keeps stable row selection after filtering
+
+## v1.57 (23-02-2026)
+- New: API-Keys now includes TradFi provider configuration for stock-perp backtesting (`yfinance` + extended provider `alpaca`/`polygon`/`finnhub`/`alphavantage`) with improved test UX and diagnostics
+- New: Market Data page now includes a full TradFi Symbol Mapping workflow (edit/search/test resolve, start-date fetch, metadata/price refresh, XYZ specs view)
+- New: `tradfi_sync.py` added for XYZ spec + TradFi map synchronization and Tiingo metadata-backed auto-mapping
+- New: Tiingo runtime/quota integration (hour/day/month tracking) with in-page usage indicators and wait-state visibility in running jobs
+- Improved: Stock-perp build pipeline moved to Tiingo IEX/FX flow with month/day progress context and FX newest→oldest backfill behavior
+- Improved: Build best 1m job progress/details now include Tiingo request stats, wait reasons, and FX backfill streak information
+- Improved: Download section naming/UX standardized (`Download l2Book from AWS`), queue moved below controls, plus collapsible `Last download job` summary
+- Improved: `Last download job` now shows detailed statistics (downloaded/skipped/failed, size totals, done/planned %, duration)
+- Fix: Strategy Explorer `Grid Size` now displays real percentage span for low-priced symbols (prevents false `0%` from integer truncation)
+- Fix: Source-index updates now use file locking to prevent race conditions during concurrent writes
+- Improved: Market-data heatmaps refined (holiday/early-close handling, session-aware minute coloring, simplified legends, duplicate/redundant panel cleanup)
+- Improved: PBData auto-prunes invalid Hyperliquid live-meta coins from enabled market-data list
+- Improved: PBCoinData mapping cycle integrates TradFi sync hooks and HIP-3 related mapping updates
+- Ops: VPS update workflows adjusted (`vps-update-coindata.yml`, `vps-update-pb.yml`, `vps-update-pbgui.yml`)
+- Docs: Help guides updated/synced in EN+DE for API-Keys and Market Data (plus related parity updates)
+
+## v1.56 (20-02-2026)
+- New: Hyperliquid HIP-3 stock perpetuals support — Exchange.py fetches and tracks stock-perp markets (AAPL, NVDA, etc.) alongside crypto swaps
+- New: PBCoinData detects and records HIP-3 markets (`is_hip3` flag); HIP-3 symbols shown in a dedicated collapsible table in Coin Data Explorer
+- New: Auto-rebuild Hyperliquid mapping when HIP-3 symbols are missing (self-heal in UI)
+- New: HIP-3 stock perpetuals excluded from dynamic ignore lists (only regular crypto swaps are written to passivbot ini)
+- New: Dedicated "Logging" page in System navigation — central log viewer for all services, configurable log rotation (default + per-service max size and backup count)
+- New: Services page redesigned — tabbed layout (Overview + per-service tabs), unified ⚙ Settings expanders with dirty-aware save buttons (blue = unsaved)
+- New: Bucket edit form inline in PBRemote Settings expander (no separate page)
+- New: PBCoinData settings moved to service details page with live API status display and 5-minute credit cache
+- New: Data-driven CMC symbol matching — static SYMBOLMAP replaced by live exchange→CMC mapping
+- New: Mapping-based coin filters for BacktestV7, RunV7, OptimizeV7 and Multi
+- New: Balance Calculator uses mapping-based instant calculation; exchange selection dialog for multi-exchange backtest configs
+- New: Help guides added for Services, PBRemote, PBCoinData, Coin Data; PBRun and PBData guides updated
+- Improved: PBRun major overhaul — atomic file writes, improved process management, hardened startup and race condition handling
+- Improved: CMC fetch resilience and error logging
+- Improved: Mapping update skip and unmatched CMC coin logging
+- Fix: Self-heal success state correctly reset after recovery
+- Fix: Balance Calculator coin parity with short coin names
+- Fix: PBCoinData API status column width and label
+- Updated: ccxt to v4.5.38
+
+## v1.55 (14-02-2026)
+- New: PB7 v7.8.x sync (candle interval, suite enablement, OHLCV source dir, market settings sources, volume normalization)
+- New: Optimizer supports candle_interval_minutes
+- New: BacktestV7 shows total_wallet_exposure, pnl_cumsum, and balance_and_equity_logy plots when available
+- Fix: Balance Calculator works with short coin names
+- Fix: Suite preflight warning logic aligned with PB7 behavior
+
+## v1.54 (14-02-2026)
+- New: **Hyperliquid Market Data** — download l2Book from AWS S3 and automatically convert to 1-minute candles
+- New: **Simplified Coin Names** — use `DOGE` instead of `DOGEUSDT`, `BONK` instead of `kBONKUSDC` everywhere (configs, inputs, all UI)
+- New: **Market Data Management Page** — centralized interface for downloading, managing, and optimizing Hyperliquid market data
+- New: **Auto-trigger Jobs** — after downloading l2Book, 1m-candle generation starts automatically (no manual step needed)
+- New: **Auto-refresh Latest 1m Candles** — PBData automatically downloads and updates the latest 1m candles from Hyperliquid API in the background (keeps your data always current)
+- New: **Use PBGui Market Data in Backtest/Optimize** — select PBGui OHLCV data as your data source for backtests and optimization runs
+- New: **Comprehensive Market Data Guides** — detailed workflows, troubleshooting, and optimization tips (EN/DE)
 
 ## v1.53 (06-02-2026)
 - New: PBData can optionally download/store **Executions (my trades)** into a dedicated trades DB.

@@ -11,8 +11,36 @@
 ## Project conventions
 
 - Streamlit/UI helpers live in `pbgui_func.py`. Pure helpers (no Streamlit) live in `pbgui_purefunc.py`.
+- Exchange operations (CCXT, market fetch, symbol info) belong in `Exchange.py`.
+- Database operations belong in `Database.py`.
 - Never open a dialog inside another dialog: within `@st.dialog` do not call `error_popup/info_popup/result_popup`; show errors inline (e.g. `st.error`).
+- Use `:material/...:` icon buttons for compact inline navigation (e.g. `:material/arrow_left:` / `:material/arrow_right:` for month navigation). Prefer material icons for concise controls consistent with existing UI.
 - When showing/exporting configs as JSON, use real JSON serialization (`json.dumps`) so `null/true/false` are preserved (avoid Python `None/True/False` formatting).
+
+## Chat trigger phrases
+
+- If the user writes `Bitte in Todo festhalten:`, store the content in `docs/roadmap/TODO.md` (do not store it in repository root files).
+- If the user writes `Merke Dir:`, store the content as a persistent instruction in this file (`.github/copilot-instructions.md`) under `## Persistent Notes`.
+
+## Persistent Notes
+
+- Future `Merke Dir:` entries must be appended here as short bullet points.
+- Before writing any `Merke Dir:` entry to the file, show the planned text as a proposal and wait for user confirmation.
+- Always write `Merke Dir:` entries in English, even if the user submits them in German.
+- **NEVER make large unsolicited design changes**: no module rewrites, file deletions, architecture overhauls, or replacing/deleting existing code without explicit user confirmation. Always propose first, ask, wait for "Yes" — then implement.
+- **Never extend the scope of a task on your own**: if you think something additional should be done, ask first — never silently do more than was requested.
+- **Stop immediately when the original request is satisfied**: do not write additional scripts, run extra tests, or take further actions beyond exactly what was asked. If something seems useful, ask first — never just do it.
+- **Symbol resolution always uses the mapping file** (`data/coindata/{exchange}/mapping.json`) — never ad-hoc CCXT market fetches or hardcoded prefix lists. For USDT linear perps filter on `quote == "USDT"` and `swap == True`. See `bybit_best_1m.py` (`_get_bybit_usdt_symbol`) and `binance_best_1m.py` (`_get_binance_symbol`) as reference implementations.
+- GUI language is English throughout; only guides/tutorials are offered in both English and German.
+- **Logging architecture (3-tier model)**:
+  - **Tier 1 — Daemon logs** (each own file): services with their own long-running daemon loop. Do NOT add to `LOG_GROUPS` — they get `data/logs/{service}.log` automatically.
+  - **Tier 2 — Data pipeline logs** (each own file): data pipeline components (database, exchange, market data, sync). Do NOT add to `LOG_GROUPS`.
+  - **Tier 3 — `PBGui.log`**: UI helper classes without their own daemon loop. MUST be added to `LOG_GROUPS` in `logging_helpers.py` (single source of truth for routing).
+  - Routing is handled via the `LOG_GROUPS` dict in `logging_helpers.py` — **never** hardcode the `logfile=` parameter at call sites.
+  - The service tag (e.g. `[VPSManager]`) is always embedded in each log entry → grep works even in a shared file.
+  - All logs go to `data/logs/` — never to any other directory.
+  - **No direct `print()` or `logging.xxx`** in GUI modules — exclusively use `_log('ServiceName', msg, level='...')` via `from logging_helpers import human_log as _log`.
+- **Migrate everything to FastAPI**: whenever code needs to be rewritten, always prefer a pure FastAPI + Vanilla JS approach (REST endpoints + WebSocket, no JS frameworks). We are gradually migrating away from Streamlit — no new Streamlit polling fragments, no `run_every`, no `st.components.v1.html()` iframes. Use `st.html(unsafe_allow_javascript=True)` only as the thin embedding shim; all logic, state, and updates go through FastAPI. Frontend is always plain Vanilla JS — no React, no Vue, no jQuery.
 
 ## Repo boundaries (important)
 
@@ -42,6 +70,13 @@
 - If a Help modal already exists on the page/module, reuse that behavior (do not invent a new modal flow).
   - Prefer opening the modal (don’t navigate away) so user context is preserved.
 
+- **Guide sync is mandatory for user-facing changes**:
+  - If a page’s visible behavior, labels, workflow, defaults, or warnings change, update the matching guide(s) in the same task.
+  - For pages with EN+DE guides, update both `docs/help/...` and `docs/help_de/...` together.
+  - This explicitly includes `navi/system_api_keys.py` and `20_api_keys.md` when API key or TradFi provider UX changes.
+  - Before finishing, verify guide parity by checking changed UI strings/options against guide text.
+  - Do not leave placeholder-only translations when a full EN guide exists; provide a real DE update.
+
 ## Backups before mass edits
 
 - **ALWAYS** create backup before using sed/awk/Python scripts for mass edits (>10 locations).
@@ -66,3 +101,83 @@
 
 - Default: PBGui + PB7 use Python 3.12.
 - PB6 stays on Python 3.10.
+
+## Logging
+
+- **ALL logs** MUST go to `data/logs/` directory.
+- **NEVER** create log files in data directories (`coindata/`, `caches/`, etc.).
+- **Never** use the standard Python `logging` module or `print()` in GUI modules.
+- Exclusively use `_log('ServiceName', msg, level='...')` via `from logging_helpers import human_log as _log`.
+- Log file routing is determined by `LOG_GROUPS` in `logging_helpers.py` (see 3-tier model in `## Persistent Notes`).
+- Always pass tracebacks via `meta={'traceback': traceback.format_exc()}` — never use `traceback.print_exc()`.
+
+## Module responsibilities
+
+- `pbgui_func.py`: Streamlit/UI helpers
+- `pbgui_purefunc.py`: Pure helpers (no Streamlit)
+- `Exchange.py`: Exchange operations (CCXT, market fetch, symbol info)
+- `Database.py`: Database operations
+- `PBCoinData.py`: CMC API, symbol lists, dynamic ignore
+- `Config.py`: V6/V7 configurations, BalanceCalculator
+- `PBRun.py`: Live instances, bot status
+
+## Data organization
+
+- `coindata/`: CMC data, exchange mappings
+- `data/`: User data, instances, configs
+- `data/logs/`: All logs (pattern: `{ModuleName}.log`)
+
+## Legacy modules (PB6)
+
+**Do not modify** unless absolutely necessary. Ask user for approval first.
+
+- `Multi.py`, `Backtest.py`, `BacktestMulti.py`, `Optimize.py`, `OptimizeMulti.py`
+- `Instance.py`
+- `navi/v6_multi_backtest.py`, `navi/v6_multi_optimize.py`, `navi/v6_multi_run.py`
+- `navi/v6_single_backtest.py`, `navi/v6_single_optimize.py`, `navi/v6_single_run.py`
+- `navi/v6_spot_view.py`
+
+## Session State patterns
+
+- Prefix with module/page name (e.g. `edit_multi_`, `bc_`, `v7_`)
+- Clean up state in navigation callbacks
+- Never modify session state directly in loops
+
+## Error handling
+
+- `error_popup()`: only for critical user-blocking errors
+- `st.error()`: inline for non-critical validation
+- `st.warning()`: for hints/warnings
+- Always log exceptions before showing popup
+- Rate limiting: use `sleep()` between API calls
+- Retry only for transient errors (Network, Timeout)
+- Never blanket catch without logging
+
+## File operations
+
+- Atomic writes (write to temp file, then rename) are required for any file that could be read by another process during writing, or where a partial write would leave the file in a corrupt state (e.g. config files, PID files, JSON data files). Not needed for log files or one-time creation.
+- When reading files, always sanitize content (e.g. `.strip()`) and handle parse errors (`ValueError`, `JSONDecodeError`, etc.) explicitly — never assume well-formed input.
+- Check `Path.exists()` before read
+- JSON with `indent=4` for readability
+- Never overwrite on fetch/parse failure
+- Use `pathlib.Path` instead of string concatenation
+
+## Naming conventions
+
+- `snake_case` for variables/functions
+- `PascalCase` for classes
+- Private methods: `_leading_underscore`
+- Constants: `UPPER_CASE`
+
+## Testing
+
+- **ALWAYS** use `venv_pbgui` virtual environment for running PBGui tests.
+- Test command: `/home/mani/software/venv_pbgui/bin/python -m pytest tests/`
+- Test structure follows Passivbot conventions:
+  - Tests organized in subdirectories: `market_data/`, `config/`, `ui/`
+  - Test files: `test_*.py`, functions: `test_*()`
+  - Use test classes to group related tests
+  - Use `@pytest.mark.parametrize` for multiple similar cases
+  - Document with docstrings: module, class, and function level
+- Write clear, focused tests with descriptive names and assertion messages.
+- See `tests/README.md` for complete testing documentation.

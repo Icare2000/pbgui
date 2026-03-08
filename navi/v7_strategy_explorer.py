@@ -49,6 +49,7 @@ from pbgui_func import (
     is_authenticted,
     is_pb7_installed,
     is_session_state_not_initialized,
+    PBGDIR,
     pb7dir,
     render_header_with_guide,
     set_page_config,
@@ -98,26 +99,99 @@ def _import_passivbot_rust(pb7_src_dir: str):
 def _get_passivbot_rust(pb7_src_dir: str):
     return _import_passivbot_rust(pb7_src_dir)
 
-def get_available_exchanges_v7() -> List[str]:
+def _get_session_ohlcv_source_dir() -> str | None:
+    try:
+        v = st.session_state.get("se_hist_config_ohlcv_source_dir")
+    except Exception:
+        v = None
+    v = str(v or "").strip()
+    return v or None
+
+
+def _get_config_ohlcv_source_dir(cfg: Any | None = None) -> str | None:
+    val = None
+    if isinstance(cfg, dict):
+        val = (cfg.get("backtest") or {}).get("ohlcv_source_dir")
+    else:
+        try:
+            val = getattr(getattr(cfg, "backtest", None), "ohlcv_source_dir", None)
+        except Exception:
+            val = None
+    val = str(val or "").strip()
+    return val or None
+
+
+def _get_pbgui_ohlcv_dir() -> str | None:
+    try:
+        base = str(PBGDIR) if PBGDIR else ""
+    except Exception:
+        base = ""
+    base = base or os.getcwd()
+    path = os.path.join(base, "data", "ohlcv")
+    return path if os.path.isdir(path) else None
+
+
+def _get_se_ohlcv_source_settings(cfg: Any | None = None) -> tuple[str | None, bool]:
+    mode = str(st.session_state.get("se_hist_ohlcv_source_mode", "PB7 cache/historical") or "PB7 cache/historical")
+    if mode == "PBGui market_data":
+        return _get_pbgui_ohlcv_dir(), True
+    if mode == "Backtest ohlcv_source_dir":
+        return (_get_config_ohlcv_source_dir(cfg) or _get_session_ohlcv_source_dir()), True
+    return None, False
+
+
+def get_available_exchanges_v7(source_dir: str | None = None, *, include_pb7: bool = True) -> List[str]:
     exchanges: set[str] = set()
 
-    # 1) Historical data layout: pb7/historical_data/ohlcvs_<exchange>/...
-    hist_dir = os.path.join(pb7dir(), "historical_data")
-    if os.path.isdir(hist_dir):
-        for d in os.listdir(hist_dir):
-            if not d.startswith("ohlcvs_"):
-                continue
-            path = os.path.join(hist_dir, d)
-            if os.path.isdir(path):
-                exchanges.add(d[len("ohlcvs_") :])
+    if include_pb7:
+        # 1) Historical data layout: pb7/historical_data/ohlcvs_<exchange>/...
+        hist_dir = os.path.join(pb7dir(), "historical_data")
+        if os.path.isdir(hist_dir):
+            for d in os.listdir(hist_dir):
+                if not d.startswith("ohlcvs_"):
+                    continue
+                path = os.path.join(hist_dir, d)
+                if os.path.isdir(path):
+                    exchanges.add(d[len("ohlcvs_") :])
 
-    # 2) CandlestickManager cache layout: pb7/caches/ohlcv/<exchange>/1m/...
-    cm_root = os.path.join(pb7dir(), "caches", "ohlcv")
-    if os.path.isdir(cm_root):
-        for d in os.listdir(cm_root):
-            path = os.path.join(cm_root, d, "1m")
-            if os.path.isdir(path):
-                exchanges.add(d)
+        # 2) CandlestickManager cache layout: pb7/caches/ohlcv/<exchange>/1m/...
+        cm_root = os.path.join(pb7dir(), "caches", "ohlcv")
+        if os.path.isdir(cm_root):
+            for d in os.listdir(cm_root):
+                path = os.path.join(cm_root, d, "1m")
+                if os.path.isdir(path):
+                    exchanges.add(d)
+
+    def _source_has_data(exchange_root: str) -> bool:
+        if not os.path.isdir(exchange_root):
+            return False
+        try:
+            for coin_dir in os.listdir(exchange_root):
+                p = os.path.join(exchange_root, coin_dir)
+                if not os.path.isdir(p) or coin_dir.startswith("."):
+                    continue
+                try:
+                    if any(
+                        f.endswith(".npy") or f.endswith(".npz")
+                        for f in os.listdir(p)
+                        if not f.startswith(".")
+                    ):
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            return False
+        return False
+
+    source_root = str(source_dir or "").strip()
+    if source_root and os.path.isdir(source_root):
+        try:
+            for d in os.listdir(source_root):
+                path = os.path.join(source_root, d, "1m")
+                if _source_has_data(path):
+                    exchanges.add(d)
+        except Exception:
+            pass
 
     return sorted(exchanges)
 
@@ -286,31 +360,56 @@ def _resolve_exchange_for_history(exchange: str, symbol: str) -> str:
     return exc
 
 
-def get_available_coins_v7(exchange: str) -> List[str]:
+def get_available_coins_v7(exchange: str, source_dir: str | None = None, *, include_pb7: bool = True) -> List[str]:
     if not exchange:
         return []
 
     coins: set[str] = set()
 
-    # 1) Historical data layout: pb7/historical_data/ohlcvs_<exchange>/<coin>/YYYY-MM-DD.npy
-    hist_sym_dir = os.path.join(pb7dir(), "historical_data", f"ohlcvs_{exchange}")
-    if os.path.isdir(hist_sym_dir):
-        for d in os.listdir(hist_sym_dir):
-            p = os.path.join(hist_sym_dir, d)
-            if os.path.isdir(p) and not d.startswith("."):
-                c = _coin_from_symbol_code(d)
-                if c:
-                    coins.add(c)
+    if include_pb7:
+        # 1) Historical data layout: pb7/historical_data/ohlcvs_<exchange>/<coin>/YYYY-MM-DD.npy
+        hist_sym_dir = os.path.join(pb7dir(), "historical_data", f"ohlcvs_{exchange}")
+        if os.path.isdir(hist_sym_dir):
+            for d in os.listdir(hist_sym_dir):
+                p = os.path.join(hist_sym_dir, d)
+                if os.path.isdir(p) and not d.startswith("."):
+                    c = _coin_from_symbol_code(d)
+                    if c:
+                        coins.add(c)
 
-    # 2) CandlestickManager cache layout: pb7/caches/ohlcv/<exchange>/1m/<symbol_code>/YYYY-MM-DD.npy
-    cm_sym_dir = os.path.join(pb7dir(), "caches", "ohlcv", exchange, "1m")
-    if os.path.isdir(cm_sym_dir):
-        for d in os.listdir(cm_sym_dir):
-            p = os.path.join(cm_sym_dir, d)
-            if os.path.isdir(p) and not d.startswith("."):
-                c = _coin_from_symbol_code(d)
-                if c:
-                    coins.add(c)
+        # 2) CandlestickManager cache layout: pb7/caches/ohlcv/<exchange>/1m/<symbol_code>/YYYY-MM-DD.npy
+        cm_sym_dir = os.path.join(pb7dir(), "caches", "ohlcv", exchange, "1m")
+        if os.path.isdir(cm_sym_dir):
+            for d in os.listdir(cm_sym_dir):
+                p = os.path.join(cm_sym_dir, d)
+                if os.path.isdir(p) and not d.startswith("."):
+                    c = _coin_from_symbol_code(d)
+                    if c:
+                        coins.add(c)
+
+    source_root = str(source_dir or "").strip()
+    if source_root:
+        src_dir = os.path.join(source_root, exchange, "1m")
+        if os.path.isdir(src_dir):
+            try:
+                for d in os.listdir(src_dir):
+                    p = os.path.join(src_dir, d)
+                    if os.path.isdir(p) and not d.startswith("."):
+                        try:
+                            has_data = any(
+                                f.endswith(".npy") or f.endswith(".npz")
+                                for f in os.listdir(p)
+                                if not f.startswith(".")
+                            )
+                        except Exception:
+                            has_data = False
+                        if not has_data:
+                            continue
+                        c = _coin_from_symbol_code(d)
+                        if c:
+                            coins.add(c)
+            except Exception:
+                pass
 
     return sorted(coins)
 
@@ -799,7 +898,13 @@ def _format_gap_summary(meta: dict) -> tuple[str, pd.DataFrame]:
     return summary, sdf
 
 @st.cache_data
-def load_historical_ohlcv_v7(exchange: str, symbol: str) -> pd.DataFrame:
+def load_historical_ohlcv_v7(
+    exchange: str,
+    symbol: str,
+    source_dir: str | None = None,
+    *,
+    prefer_source_only: bool = False,
+) -> pd.DataFrame:
     """Load 1m candles for a coin.
 
     Supports both PB7 formats:
@@ -894,6 +999,33 @@ def load_historical_ohlcv_v7(exchange: str, symbol: str) -> pd.DataFrame:
 
         return None
 
+    def _df_from_npz(path: str) -> pd.DataFrame | None:
+        try:
+            with np.load(path) as data:
+                if "candles" not in data:
+                    return None
+                arr = data["candles"]
+            if not isinstance(arr, np.ndarray) or arr.dtype.names is None:
+                return None
+            required = ("ts", "o", "h", "l", "c", "bv")
+            if any(name not in arr.dtype.names for name in required):
+                return None
+            df = pd.DataFrame(
+                {
+                    "timestamp": arr["ts"].astype(np.int64),
+                    "open": arr["o"].astype(float),
+                    "high": arr["h"].astype(float),
+                    "low": arr["l"].astype(float),
+                    "close": arr["c"].astype(float),
+                    "volume": arr["bv"].astype(float),
+                }
+            )
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+            df.set_index("timestamp", inplace=True)
+            return df
+        except Exception:
+            return None
+
     # Normalize symbol codes coming from configs/UI.
     # Example: config may contain "DOGEUSDT" while PB7 caches use "DOGE_USDT:USDT".
     sym_raw = str(symbol or "").strip()
@@ -930,8 +1062,79 @@ def load_historical_ohlcv_v7(exchange: str, symbol: str) -> pd.DataFrame:
             return True
         return False
 
+    def _load_source_dir_df(exchange_dir: str) -> pd.DataFrame:
+        source_root = str(source_dir or "").strip()
+        if not source_root:
+            return pd.DataFrame()
+        source_base = os.path.join(source_root, exchange_dir, "1m")
+        if not os.path.isdir(source_base):
+            return pd.DataFrame()
+
+        candidates: list[str] = []
+        try:
+            for d in os.listdir(source_base):
+                for c in coin_candidates:
+                    if _dir_matches_coin(d, c):
+                        candidates.append(d)
+                        break
+        except Exception:
+            candidates = []
+
+        target_dir = None
+        if candidates:
+            best = None
+            best_count = -1
+            for cdir in candidates:
+                pdir = os.path.join(source_base, cdir)
+                if not os.path.isdir(pdir):
+                    continue
+                try:
+                    n_shards = sum(
+                        1
+                        for f in os.listdir(pdir)
+                        if (f.endswith(".npy") or f.endswith(".npz")) and not f.startswith(".")
+                    )
+                except Exception:
+                    n_shards = 0
+                if n_shards > best_count:
+                    best = cdir
+                    best_count = n_shards
+            if best is None:
+                best = candidates[0]
+            target_dir = os.path.join(source_base, best)
+
+        dfs_source: list[pd.DataFrame] = []
+        if target_dir and os.path.isdir(target_dir):
+            try:
+                shard_files = sorted(
+                    [f for f in os.listdir(target_dir) if (f.endswith(".npy") or f.endswith(".npz")) and not f.startswith(".")]
+                )
+            except Exception:
+                shard_files = []
+            for f in shard_files:
+                p = os.path.join(target_dir, f)
+                df_shard = _df_from_npz(p) if f.endswith(".npz") else _df_from_npy(np.load(p))
+                if df_shard is not None and not df_shard.empty:
+                    dfs_source.append(df_shard)
+
+        return _dedupe_sort(pd.concat(dfs_source)) if dfs_source else pd.DataFrame()
+
     dfs_cm: list[pd.DataFrame] = []
     dfs_hist: list[pd.DataFrame] = []
+
+    source_df = pd.DataFrame()
+    exchange_dir = str(exchange or "").strip().lower()
+    exchange_dirs = [exchange_dir] if exchange_dir else []
+    if exchange_dir == "binance":
+        exchange_dirs.append("binanceusdm")
+    elif exchange_dir == "binanceusdm":
+        exchange_dirs.append("binance")
+    for exc_dir in exchange_dirs:
+        source_df = _load_source_dir_df(exc_dir)
+        if source_df is not None and not source_df.empty:
+            return source_df
+    if prefer_source_only and str(source_dir or "").strip():
+        return pd.DataFrame()
 
     # 1) CandlestickManager cache: pb7/caches/ohlcv/<exchange>/1m/<symbol_code>/YYYY-MM-DD.npy
     cm_base = os.path.join(pb7dir(), "caches", "ohlcv", exchange, "1m")
@@ -2443,7 +2646,13 @@ def _run_compare_from_pb7_backtest_dir(
         warmup_minutes = int(_compute_warmup_minutes_for_mode_c(bp_long, bp_short))
 
     # Candle range needed
-    hist_df_full = load_historical_ohlcv_v7(exchange, coin)
+    source_dir, prefer_source_only = _get_se_ohlcv_source_settings(cfg)
+    hist_df_full = load_historical_ohlcv_v7(
+        exchange,
+        coin,
+        source_dir=source_dir,
+        prefer_source_only=prefer_source_only,
+    )
     if hist_df_full is None or hist_df_full.empty:
         return (pb7_long, pb7_short), ([], []), ([], []), {"exchange": exchange, "coin": coin, "start_ts": start_ts, "end_ts": end_ts}
 
@@ -2672,7 +2881,12 @@ def _run_pb7_engine_backtest_for_visualizer(
     # PB7 provides real BTC prices; use best-effort lookup and align to this window.
     btc_usd = np.ones((hlcvs.shape[0],), dtype=np.float64)
     try:
-        btc_df = load_historical_ohlcv_v7(exchange, "BTC")
+        btc_df = load_historical_ohlcv_v7(
+            exchange,
+            "BTC",
+            source_dir=source_dir,
+            prefer_source_only=prefer_source_only,
+        )
         if btc_df is not None and not btc_df.empty and "close" in btc_df.columns:
             btc_close = (
                 btc_df[["close"]]
@@ -3190,7 +3404,13 @@ def _pb7_debug_dump_orders_around_ts_for_visualizer(
 
     btc_usd = np.ones((hlcvs.shape[0],), dtype=np.float64)
     try:
-        btc_df = load_historical_ohlcv_v7(exchange, "BTC")
+        source_dir, prefer_source_only = _get_se_ohlcv_source_settings(config)
+        btc_df = load_historical_ohlcv_v7(
+            exchange,
+            "BTC",
+            source_dir=source_dir,
+            prefer_source_only=prefer_source_only,
+        )
         if btc_df is not None and not btc_df.empty and "close" in btc_df.columns:
             btc_close = (
                 btc_df[["close"]]
@@ -5061,7 +5281,7 @@ def render_replay_backtest_v7(*, replay_frames: list[dict], hist_df: pd.DataFram
         height=800,
         margin=dict(l=50, r=50, t=50, b=50),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
     # Minimal per-frame details
     st.caption(
@@ -7220,10 +7440,10 @@ class GVData:
     gridonly_entries_short: List[Order] = field(default_factory=list)
     gridonly_closes_short: List[Order] = field(default_factory=list)
 
-    long_entry_grid: int = 0
-    long_close_grid: int = 0
-    short_entry_grid: int = 0
-    short_close_grid: int = 0
+    long_entry_grid: float = 0.0
+    long_close_grid: float = 0.0
+    short_entry_grid: float = 0.0
+    short_close_grid: float = 0.0
 
     # Visualization-only: potential trailing entry levels ("what if trailing is active")
     potential_entry_trailing_prices_long: List[float] = field(default_factory=list)
@@ -7388,6 +7608,15 @@ def prepare_config() -> GVData:
         except Exception:
             cfg_exchanges = []
         cfg_exchange = str(cfg_exchanges[0]) if cfg_exchanges else ""
+
+        try:
+            cfg_ohlcv_source_dir = str(getattr(getattr(config_v7, "backtest", None), "ohlcv_source_dir", "") or "").strip()
+        except Exception:
+            cfg_ohlcv_source_dir = ""
+        if cfg_ohlcv_source_dir:
+            st.session_state.se_hist_config_ohlcv_source_dir = cfg_ohlcv_source_dir
+        else:
+            st.session_state.pop("se_hist_config_ohlcv_source_dir", None)
 
         cfg_coins: list[str] = []
         try:
@@ -7655,6 +7884,16 @@ def create_plotly_graph(side: OrderType, data: GVData):
             if bid > 0.0 and ask > 0.0:
                 start_price = (bid + ask) / 2.0
 
+    def _grid_range_pct(min_price: float, max_price: float) -> float:
+        if min_price <= 0.0 or max_price <= 0.0:
+            return 0.0
+        ref = (min_price + max_price) / 2.0
+        if ref <= 0.0:
+            ref = max_price
+        if ref <= 0.0:
+            return 0.0
+        return max(0.0, ((max_price - min_price) / ref) * 100.0)
+
     enable_plotly_entry_spacing_slider = False
 
     # Extract entry and close prices (server-side computed baseline)
@@ -7662,11 +7901,12 @@ def create_plotly_graph(side: OrderType, data: GVData):
     if len(normal_entry_prices) > 0:
         normal_enty_grid_min = min(normal_entry_prices)
         normal_enty_grid_max = max(normal_entry_prices)
+        entry_grid_pct = _grid_range_pct(float(normal_enty_grid_min), float(normal_enty_grid_max))
         
         if side == Side.Long:
-            data.long_entry_grid = normal_enty_grid_max - normal_enty_grid_min
+            data.long_entry_grid = entry_grid_pct
         else:
-            data.short_entry_grid = normal_enty_grid_max - normal_enty_grid_min
+            data.short_entry_grid = entry_grid_pct
     else:
         normal_enty_grid_min = 100
         normal_enty_grid_max = 100
@@ -7676,11 +7916,12 @@ def create_plotly_graph(side: OrderType, data: GVData):
     if len(normal_close_prices) > 0:
         normal_close_grid_min = min(normal_close_prices)
         normal_close_grid_max = max(normal_close_prices)
+        close_grid_pct = _grid_range_pct(float(normal_close_grid_min), float(normal_close_grid_max))
         
         if side == Side.Long:
-            data.long_close_grid = normal_close_grid_max - normal_close_grid_min
+            data.long_close_grid = close_grid_pct
         else:
-            data.short_close_grid = normal_close_grid_max - normal_close_grid_min
+            data.short_close_grid = close_grid_pct
     else:
         normal_close_grid_min = 100
         normal_close_grid_max = 100
@@ -8935,7 +9176,7 @@ def create_plotly_graph(side: OrderType, data: GVData):
                 "?",
                 key=f"se_chart_help_btn_{title_side.lower()}",
                 help="Show/hide chart help",
-                use_container_width=True,
+                width='stretch',
             ):
                 st.session_state[help_state_key] = not bool(st.session_state.get(help_state_key, False))
 
@@ -9012,7 +9253,7 @@ def create_plotly_graph(side: OrderType, data: GVData):
                     ]
                     if cols:
                         df_fills = df_fills[cols]
-                    st.dataframe(df_fills, use_container_width=True, height=250)
+                    st.dataframe(df_fills, width='stretch', height=250)
     except Exception:
         pass
 
@@ -9117,6 +9358,9 @@ def create_statistics(side: OrderType, data: GVData):
     # Display the main statistics as a table
     st.write(f"**{title_side} Statistics**")
 
+    def _format_grid_pct(value: float) -> str:
+        return f"{float(value):.2f}%"
+
     stats_data = {
         "Metric": [
             "Entry: Mode",
@@ -9132,11 +9376,11 @@ def create_statistics(side: OrderType, data: GVData):
             str(data.long_entry_mode.name if title_side == "LONG" else data.short_entry_mode.name),
             str(entry_count),
             str(avg_entry_price) if avg_entry_price is not None else "N/A", 
-            f"{int(data.long_entry_grid)}%" if title_side == "LONG" else f"{int(data.short_entry_grid)}%",
+            _format_grid_pct(data.long_entry_grid) if title_side == "LONG" else _format_grid_pct(data.short_entry_grid),
             str(data.long_close_mode.name if title_side == "LONG" else data.short_close_mode.name),
             str(close_count),
             str(avg_close_price) if avg_close_price is not None else "N/A",
-            f"{int(data.long_close_grid)}%" if title_side == "LONG" else f"{int(data.short_close_grid)}%",
+            _format_grid_pct(data.long_close_grid) if title_side == "LONG" else _format_grid_pct(data.short_close_grid),
         ]
     }
 
@@ -9447,12 +9691,40 @@ def show_visualizer():
         hist_df = None
         min_day = None
         max_day = None
+        source_dir, prefer_source_only = _get_se_ohlcv_source_settings(st.session_state.get("v7_strategy_explorer_config"))
 
         with st.expander("Data + Time & View", expanded=True):
-            exchanges = get_available_exchanges_v7()
+            ohlcv_source_modes = ["PB7 cache/historical", "Backtest ohlcv_source_dir", "PBGui market_data"]
+            cfg_dir = _get_session_ohlcv_source_dir() or _get_config_ohlcv_source_dir(
+                st.session_state.get("v7_strategy_explorer_config")
+            )
+            if "se_hist_ohlcv_source_mode" not in st.session_state:
+                st.session_state.se_hist_ohlcv_source_mode = "Backtest ohlcv_source_dir" if cfg_dir else "PB7 cache/historical"
+            elif cfg_dir and st.session_state.se_hist_ohlcv_source_mode == "PB7 cache/historical":
+                st.session_state.se_hist_ohlcv_source_mode = "Backtest ohlcv_source_dir"
+            st.selectbox("OHLCV source", ohlcv_source_modes, key="se_hist_ohlcv_source_mode")
+
+            mode_now = str(st.session_state.get("se_hist_ohlcv_source_mode") or "")
+            mode_last = str(st.session_state.get("se_hist_ohlcv_source_mode_last") or "")
+            if mode_now != mode_last:
+                st.session_state.se_hist_ohlcv_source_mode_last = mode_now
+                st.session_state.se_hist_exchange = ""
+                st.session_state.se_hist_exchange_last = ""
+                st.session_state.se_hist_coin = ""
+
+            source_dir, prefer_source_only = _get_se_ohlcv_source_settings(st.session_state.get("v7_strategy_explorer_config"))
+            exchanges = get_available_exchanges_v7(source_dir=source_dir, include_pb7=not prefer_source_only)
             cfg_exc = str(st.session_state.get("se_hist_config_exchange", "") or "")
-            if cfg_exc and cfg_exc not in exchanges:
+            if cfg_exc and cfg_exc not in exchanges and not prefer_source_only:
                 exchanges = [cfg_exc] + exchanges
+
+            if not str(st.session_state.get("se_hist_exchange", "") or ""):
+                if cfg_exc and cfg_exc in exchanges:
+                    st.session_state.se_hist_exchange = cfg_exc
+                    st.session_state.se_hist_exchange_last = cfg_exc
+                elif exchanges:
+                    st.session_state.se_hist_exchange = exchanges[0]
+                    st.session_state.se_hist_exchange_last = exchanges[0]
 
             sel_exc = st.selectbox("Exchange", [""] + exchanges, key="se_hist_exchange")
 
@@ -9471,7 +9743,13 @@ def show_visualizer():
                 if cfg_exc and str(sel_exc or "") == cfg_exc and cfg_coins:
                     coins = cfg_coins
                 else:
-                    coins = get_available_coins_v7(sel_exc)
+                    coins = get_available_coins_v7(sel_exc, source_dir=source_dir, include_pb7=not prefer_source_only)
+
+                if not str(st.session_state.get("se_hist_coin", "") or ""):
+                    if cfg_coins and cfg_exc and str(sel_exc or "") == cfg_exc and cfg_coins[0] in coins:
+                        st.session_state.se_hist_coin = str(cfg_coins[0])
+                    elif coins:
+                        st.session_state.se_hist_coin = coins[0]
 
                 # Ensure the current selection is always in the option list to avoid Streamlit widget errors.
                 cur_coin = str(st.session_state.get("se_hist_coin", "") or "")
@@ -9483,7 +9761,12 @@ def show_visualizer():
                 st.selectbox("Coin", [], disabled=True, key="se_hist_coin")
 
             if sel_exc and sel_sym:
-                hist_df = load_historical_ohlcv_v7(sel_exc, sel_sym)
+                hist_df = load_historical_ohlcv_v7(
+                    sel_exc,
+                    sel_sym,
+                    source_dir=source_dir,
+                    prefer_source_only=prefer_source_only,
+                )
 
             if hist_df is not None and not hist_df.empty:
                 st.info(f"Loaded {len(hist_df)} candles for {sel_sym}")
@@ -10357,7 +10640,7 @@ def show_visualizer():
                     "Start Simulation (entry fills)",
                     key="se_hist_sim_start_btn",
                     type="primary",
-                    use_container_width=True,
+                    width='stretch',
                     help="Runs the historical candle-walk simulation from the selected start time and stores fill markers.",
                     on_click=_request_hist_sim_run,
                 )
@@ -10413,7 +10696,7 @@ def show_visualizer():
                     "Start Compare (PB7/B/C)",
                     key="se_hist_compare_start_btn",
                     type="primary",
-                    use_container_width=True,
+                    width='stretch',
                     help="Runs compare and renders the table below (stored in session state).",
                     on_click=_request_hist_compare_run,
                 )
@@ -11229,10 +11512,10 @@ def show_visualizer():
                     if (not movie_generated_this_run) and (not do_export):
                         with movie_out:
                             if fig is not None:
-                                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True})
+                                st.plotly_chart(fig, width='stretch', config={"displayModeBar": True})
                             try:
                                 if df_fills is not None and hasattr(df_fills, "empty") and not df_fills.empty:
-                                    st.dataframe(df_fills, use_container_width=True, height=250)
+                                    st.dataframe(df_fills, width='stretch', height=250)
                                     try:
                                         # Summary below the table
                                         fills_n = int(len(df_fills))
@@ -11789,7 +12072,13 @@ def show_visualizer():
             sel_exc = str(st.session_state.get("se_hist_exchange", "") or "")
             sel_coin = str(st.session_state.get("se_hist_coin", "") or "")
             if sel_exc and sel_coin and data.analysis_time is not None:
-                hist_df_full = load_historical_ohlcv_v7(sel_exc, sel_coin)
+                source_dir, prefer_source_only = _get_se_ohlcv_source_settings()
+                hist_df_full = load_historical_ohlcv_v7(
+                    sel_exc,
+                    sel_coin,
+                    source_dir=source_dir,
+                    prefer_source_only=prefer_source_only,
+                )
                 if not hist_df_full.empty:
                     events_long, events_short = _run_pb7_engine_backtest_for_visualizer(
                         pbr=pbr,
@@ -11822,7 +12111,13 @@ def show_visualizer():
 
             sim_df = pd.DataFrame()
             if sel_exc and sel_coin and trade_start_time is not None:
-                hist_df_full = load_historical_ohlcv_v7(sel_exc, sel_coin)
+                source_dir, prefer_source_only = _get_se_ohlcv_source_settings()
+                hist_df_full = load_historical_ohlcv_v7(
+                    sel_exc,
+                    sel_coin,
+                    source_dir=source_dir,
+                    prefer_source_only=prefer_source_only,
+                )
                 if hist_df_full is not None and not hist_df_full.empty:
                     base_tf_mins = _infer_hist_base_tf_minutes(hist_df_full)
                     warmup_minutes = int(
@@ -12033,7 +12328,13 @@ def show_visualizer():
                 pb7_long, pb7_short = [], []
 
             if sel_exc and sel_coin and trade_start_time is not None:
-                hist_df_full = load_historical_ohlcv_v7(sel_exc, sel_coin)
+                source_dir, prefer_source_only = _get_se_ohlcv_source_settings()
+                hist_df_full = load_historical_ohlcv_v7(
+                    sel_exc,
+                    sel_coin,
+                    source_dir=source_dir,
+                    prefer_source_only=prefer_source_only,
+                )
                 if hist_df_full is not None and not hist_df_full.empty:
                     # Root-cause: Mode B and Mode C must use the same warmup length and candle stream.
                     # If warmup differs, EMA/trailing state can diverge and shift fills by 1 candle.
@@ -12408,7 +12709,7 @@ def show_visualizer():
                             st.info(summary)
                         if not sample_df.empty:
                             with st.expander("Missing candles (sample)", expanded=False):
-                                st.dataframe(sample_df, use_container_width=True, height=200)
+                                st.dataframe(sample_df, width='stretch', height=200)
 
                         # Offer actions.
                         try:
@@ -12434,7 +12735,7 @@ def show_visualizer():
                         if st.button(
                             "Shift start time forward (keep warmup)",
                             key="se_compare_shift_start_btn",
-                            use_container_width=True,
+                            width='stretch',
                             help="Moves the analysis/compare start forward so the required warmup window no longer includes missing candles (or missing history before the first available candle).",
                         ):
                             try:
@@ -12455,7 +12756,13 @@ def show_visualizer():
 
                                 # Clamp into available candle range (best-effort).
                                 try:
-                                    hist_df_full = load_historical_ohlcv_v7(sel_exc, sel_sym)
+                                    source_dir, prefer_source_only = _get_se_ohlcv_source_settings()
+                                    hist_df_full = load_historical_ohlcv_v7(
+                                        sel_exc,
+                                        sel_sym,
+                                        source_dir=source_dir,
+                                        prefer_source_only=prefer_source_only,
+                                    )
                                     if hist_df_full is not None and not hist_df_full.empty:
                                         min_ts = pd.to_datetime(hist_df_full.index.min())
                                         max_ts = pd.to_datetime(hist_df_full.index.max())
@@ -12542,7 +12849,7 @@ def show_visualizer():
                         if mismatches_only and not cmp_df.empty:
                             cmp_df = cmp_df[cmp_df["status"] != "match"].copy()
                         st.write(f"**{title}**")
-                        st.dataframe(cmp_df, use_container_width=True)
+                        st.dataframe(cmp_df, width='stretch')
 
                         # Debug helper: dump PB7 open orders around the first mismatch.
                         # This helps determine whether the mismatching fill is caused by
@@ -12561,7 +12868,13 @@ def show_visualizer():
                                 if not (isinstance(dbg, dict) and dbg.get("ts") == str(first_ts)):
                                     sel_exc = str((meta or {}).get("exchange") or st.session_state.get("se_hist_exchange") or "")
                                     sel_coin = str((meta or {}).get("coin") or st.session_state.get("se_hist_coin") or "")
-                                    hist_df_full = load_historical_ohlcv_v7(sel_exc, sel_coin)
+                                    source_dir, prefer_source_only = _get_se_ohlcv_source_settings()
+                                    hist_df_full = load_historical_ohlcv_v7(
+                                        sel_exc,
+                                        sel_coin,
+                                        source_dir=source_dir,
+                                        prefer_source_only=prefer_source_only,
+                                    )
                                     warmup_used = None
                                     try:
                                         warmup_used = int((meta or {}).get("mode_c_warmup_used"))
@@ -12629,7 +12942,13 @@ def show_visualizer():
                                     end_debug = pd.Timestamp(first_ts).floor("min") + pd.Timedelta(minutes=2)
                                     end_run = end_debug + pd.Timedelta(minutes=5)
 
-                                    hist_df_full = load_historical_ohlcv_v7(sel_exc, sel_coin)
+                                    source_dir, prefer_source_only = _get_se_ohlcv_source_settings()
+                                    hist_df_full = load_historical_ohlcv_v7(
+                                        sel_exc,
+                                        sel_coin,
+                                        source_dir=source_dir,
+                                        prefer_source_only=prefer_source_only,
+                                    )
                                     try:
                                         sim_df_dbg = hist_df_full.loc[warm_start_local:end_run].copy() if hist_df_full is not None else pd.DataFrame()
                                     except Exception:
@@ -13616,7 +13935,7 @@ def generate_animation_v7(start_time, frames, step_mins, hist_df, symbol, contex
     layout = go.Layout(**layout_args)
     
     fig = go.Figure(data=init_data, layout=layout, frames=fig_frames)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
 
 def generate_animation_v7_modeb(
@@ -14861,7 +15180,7 @@ def generate_animation_v7_modeb(
             }
         except Exception:
             pass
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True})
+        st.plotly_chart(fig, width='stretch', config={"displayModeBar": True})
 
         # Fills table under the chart
         try:
@@ -14892,7 +15211,7 @@ def generate_animation_v7_modeb(
                     st.session_state["se_movie_fills_modeb"] = df_fills
                 except Exception:
                     pass
-                st.dataframe(df_fills, use_container_width=True, height=250)
+                st.dataframe(df_fills, width='stretch', height=250)
                 try:
                     fills_n = int(len(df_fills))
                     df_s = df_fills
@@ -16131,7 +16450,7 @@ def generate_animation_v7_modec(
             }
         except Exception:
             pass
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True})
+        st.plotly_chart(fig, width='stretch', config={"displayModeBar": True})
 
         # Fills table under the chart
         try:
@@ -16158,7 +16477,7 @@ def generate_animation_v7_modec(
                     st.session_state["se_movie_fills_modec"] = df_fills
                 except Exception:
                     pass
-                st.dataframe(df_fills, use_container_width=True, height=250)
+                st.dataframe(df_fills, width='stretch', height=250)
                 # Summary (keep robust: don't hide the whole section due to one parsing error)
                 fills_n = int(len(df_fills))
                 df_s = df_fills

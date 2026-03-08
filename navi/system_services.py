@@ -3,12 +3,10 @@ from pbgui_func import (
     set_page_config,
     is_session_state_not_initialized,
     is_authenticted,
-    error_popup,
-    info_popup,
     get_navi_paths,
-    sync_api,
-    PBGDIR,
+    render_log_viewer,
     render_header_with_guide,
+    PBGDIR,
 )
 from pbgui_purefunc import load_ini, save_ini
 import json
@@ -18,7 +16,6 @@ import html as _html
 from pathlib import Path
 import pbgui_help
 from Monitor import Monitor
-from logging_view import view_log_filtered
 from Exchange import MAX_PRIVATE_WS_GLOBAL, Exchanges
 
 
@@ -91,328 +88,450 @@ def _help_modal(default_topic: str = "PBData"):
         pass
 
 
-def pbrun_overview():
+def pbrun_overview(key_suffix=""):
     pbrun = st.session_state.pbrun
-    pbrun_status = pbrun.is_running()
-    if "service_pbrun" in st.session_state:
-        if st.session_state.service_pbrun != pbrun_status:
-            pbrun_status = st.session_state.service_pbrun
-    st.toggle("PBRun", value=pbrun_status, key="service_pbrun", help=pbgui_help.pbrun)
-    if pbrun_status:
+    _key = f"service_pbrun{key_suffix}"
+    is_running = pbrun.is_running()
+    desired = st.session_state.get(_key, is_running)
+    st.toggle("PBRun", value=is_running, key=_key, help=pbgui_help.pbrun)
+    if desired and not is_running:
         pbrun.run()
-        pbrun_icon = '✅'
-    else:
+    elif not desired and is_running:
         pbrun.stop()
-        pbrun_icon = '❌'
-    st.metric(label="PBRun", value=pbrun_icon)
 
-def pbremote_overview():
+def pbremote_overview(key_suffix=""):
     pbremote = st.session_state.pbremote
-    pbremote_status = pbremote.is_running()
-    if "service_pbremote" in st.session_state:
-        if st.session_state.service_pbremote != pbremote_status:
-            pbremote_status = st.session_state.service_pbremote
-    st.toggle("PBRemote", value=pbremote_status, key="service_pbremote", help=pbgui_help.pbremote)
-    if pbremote_status:
+    _key = f"service_pbremote{key_suffix}"
+    is_running = pbremote.is_running()
+    desired = st.session_state.get(_key, is_running)
+    st.toggle("PBRemote", value=is_running, key=_key, help=pbgui_help.pbremote)
+    if desired and not is_running:
         pbremote.run()
-        pbremote_icon = '✅'
-    else:
+    elif not desired and is_running:
         pbremote.stop()
-        pbremote_icon = '❌'
-    st.metric(label="PBRemote", value=pbremote_icon)
 
-def pbmon_overview():
+def pbmon_overview(key_suffix=""):
     pbmon = st.session_state.pbmon
-    pbmon_status = pbmon.is_running()
-    if "service_pbmon" in st.session_state:
-        if st.session_state.service_pbmon != pbmon_status:
-            pbmon_status = st.session_state.service_pbmon
-    st.toggle("PBMon", value=pbmon_status, key="service_pbmon", help=pbgui_help.pbmon)
-    if pbmon_status:
+    _key = f"service_pbmon{key_suffix}"
+    is_running = pbmon.is_running()
+    desired = st.session_state.get(_key, is_running)
+    st.toggle("PBMon", value=is_running, key=_key, help=pbgui_help.pbmon)
+    if desired and not is_running:
         pbmon.run()
-        pbmon_icon = '✅'
-    else:
+    elif not desired and is_running:
         pbmon.stop()
-        pbmon_icon = '❌'
-    st.metric(label="PBMon", value=pbmon_icon)
 
-def pbstat_overview():
+def pbstat_overview(key_suffix=""):
     pbstat = st.session_state.pbstat
-    pbstat_status = pbstat.is_running()
-    if "service_pbstat" in st.session_state:
-        if st.session_state.service_pbstat != pbstat_status:
-            pbstat_status = st.session_state.service_pbstat
-    st.toggle("PBStat", value=pbstat_status, key="service_pbstat", help=pbgui_help.pbstat)
-    if pbstat_status:
+    _key = f"service_pbstat{key_suffix}"
+    is_running = pbstat.is_running()
+    desired = st.session_state.get(_key, is_running)
+    st.toggle("PBStat", value=is_running, key=_key, help=pbgui_help.pbstat)
+    if desired and not is_running:
         pbstat.run()
-        pbstat_icon = '✅'
-    else:
+    elif not desired and is_running:
         pbstat.stop()
-        pbstat_icon = '❌'
-    st.metric(label="PBStat", value=pbstat_icon)
 
-def pbdata_overview():
+def pbdata_overview(key_suffix=""):
     pbdata = st.session_state.pbdata
-    pbdata_status = pbdata.is_running()
-    if "service_pbdata" in st.session_state:
-        if st.session_state.service_pbdata != pbdata_status:
-            pbdata_status = st.session_state.service_pbdata
-    st.toggle("PBData", value=pbdata_status, key="service_pbdata", help=pbgui_help.pbdata)
-    if pbdata_status:
+    _key = f"service_pbdata{key_suffix}"
+    is_running = pbdata.is_running()
+    desired = st.session_state.get(_key, is_running)
+    st.toggle("PBData", value=is_running, key=_key, help=pbgui_help.pbdata)
+    if desired and not is_running:
         pbdata.run()
-        pbdata_icon = '✅'
-    else:
+    elif not desired and is_running:
         pbdata.stop()
-        pbdata_icon = '❌'
-    st.metric(label="PBData", value=pbdata_icon)
 
-def pbcoindata_overview():
+def pbcoindata_overview(key_suffix=""):
     pbcoindata = st.session_state.pbcoindata
-    pbcoindata_status = pbcoindata.is_running()
-    if "service_pbcoindata" in st.session_state:
-        if st.session_state.service_pbcoindata != pbcoindata_status:
-            pbcoindata_status = st.session_state.service_pbcoindata
-    st.toggle("PBCoinData", value=pbcoindata_status, key="service_pbcoindata", help=pbgui_help.pbcoindata)
-    if pbcoindata_status:
+    _key = f"service_pbcoindata{key_suffix}"
+    is_running = pbcoindata.is_running()
+    desired = st.session_state.get(_key, is_running)
+    st.toggle("PBCoinData", value=is_running, key=_key, help=pbgui_help.pbcoindata)
+    if desired and not is_running:
         pbcoindata.run()
-        pbcoindata_icon = '✅'
-    else:
+    elif not desired and is_running:
         pbcoindata.stop()
-        pbcoindata_icon = '❌'
-    st.metric(label="PBCoinData", value=pbcoindata_icon)
-    
+
+def api_server_overview(key_suffix=""):
+    api_server = st.session_state.api_server
+    is_running = api_server.is_running()
+
+    # Fire centered notification on the rerun *after* restart (pop ensures exactly once)
+    _msg_key = "api_server_restart_msg"
+    _pending = st.session_state.pop(_msg_key, None)
+    if _pending:
+        kind, pid = _pending
+        if kind == "success":
+            _notif_text = f"✅ PBAPIServer restarted (PID {pid})"
+            _notif_color = "#1e7e34"
+        else:
+            _notif_text = "🚨 PBAPIServer failed to start — check logs"
+            _notif_color = "#8b0000"
+        st.html(f"""
+<style>
+@keyframes _pbapi_fade {{
+  0%   {{ opacity: 1; transform: translate(-50%, -50%) scale(1); }}
+  70%  {{ opacity: 1; transform: translate(-50%, -50%) scale(1); }}
+  100% {{ opacity: 0; transform: translate(-50%, -50%) scale(0.95); }}
+}}
+._pbapi_notif {{
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: {_notif_color};
+  color: #fff;
+  padding: 1rem 2rem;
+  border-radius: 10px;
+  font-size: 1.1rem;
+  font-weight: 600;
+  z-index: 99999;
+  box-shadow: 0 4px 24px rgba(0,0,0,0.5);
+  animation: _pbapi_fade 3s ease forwards;
+  pointer-events: none;
+}}
+</style>
+<div class="_pbapi_notif">{_notif_text}</div>
+""")
+
+    if is_running:
+        label = ":green[🟢 PBAPIServer ●]"
+    else:
+        label = ":red[🔴 PBAPIServer ○]"
+
+    if st.button(label, key=f"restart_api{key_suffix}", help="Click to restart PBAPIServer"):
+        api_server.restart()
+        if api_server.is_running():
+            st.session_state[_msg_key] = ("success", api_server.my_pid)
+        else:
+            st.session_state[_msg_key] = ("error", None)
+        st.rerun()
+
 def overview():
-    col_1, col_2, col_3, col_4, col_5, col_6 = st.columns([1,1,1,1,1,1])
-    with col_1:
-        pbrun_overview()
-        if st.button("Show Details", key="button_pbrun_details"):
-            st.session_state.pbrun_details = True
-            st.rerun()
-    with col_2:
-        pbremote_overview()
-        if st.button("Show Details", key="button_pbremote_details"):
-            st.session_state.pbremote_details = True
-            st.rerun()
-    with col_3:
-        pbmon_overview()
-        if st.button("Show Details", key="button_pbmon_details"):
-            st.session_state.pbmon_details = True
-            st.rerun()
-    with col_4:
-        pbstat_overview()
-        if st.button("Show Details", key="button_pbstat_details"):
-            st.session_state.pbstat_details = True
-            st.rerun()
-    with col_5:
-        pbdata_overview()
-        if st.button("Show Details", key="button_pbdata_details"):
-            st.session_state.pbdata_details = True
-            st.rerun()
-    with col_6:
-        pbcoindata_overview()
-        if st.button("Show Details", key="button_pbcoindata_details"):
-            st.session_state.pbcoindata_details = True
-            st.rerun()
+    _services = [
+        ("PBRun",      pbrun_overview),
+        ("PBRemote",   pbremote_overview),
+        ("PBMon",      pbmon_overview),
+        ("PBStat",     pbstat_overview),
+        ("PBData",     pbdata_overview),
+        ("PBCoinData", pbcoindata_overview),
+        ("PBAPIServer", api_server_overview),
+    ]
+    cols = st.columns(4)
+    for i, (name, fn) in enumerate(_services):
+        with cols[i % 4]:
+            with st.container(border=True):
+                fn(key_suffix="_ov")
 
 def pbrun_details():
-    # Navigation
-    with st.sidebar:
-        if st.button(":back:", key="button_pbrun_back"):
-            del st.session_state.pbrun_details
-            st.rerun()
-    st.subheader("PBRun Details")
-    pbrun_overview()
-    if st.checkbox("Show logfile", key="pbrun_log"):
-        st.session_state.pbgui_instances.view_log("PBRun")
+    render_log_viewer(preselect="PBRun.log", iframe_height_offset=280)
 
-def pbremote_details():
-    # Init PBRemote
+def _pbremote_sidebar():
+    """Sidebar content for PBRemote: overview toggle + action buttons + server list."""
     pbremote = st.session_state.pbremote
-    # Init Monitor
     if "monitor" not in st.session_state:
         st.session_state.monitor = Monitor()
     monitor = st.session_state.monitor
-    # Init from session_state keys
-    if "pbremote_bucket" in st.session_state:
-        if st.session_state.pbremote_bucket != pbremote.bucket:
-            pbremote.bucket = st.session_state.pbremote_bucket
-    # Navigation
-    with st.sidebar:
-        col1, col2, col3, col4 = st.columns([1, 1, 1 ,1])
-        with col1:
-            if st.button(":material/refresh:"):
-                pbremote.update_remote_servers()
+
+    # Pre-compute api_sync so we can show status before the server list
+    api_sync = [
+        s for s in pbremote.remote_servers
+        if s.is_online() and not s.is_api_md5_same(pbremote.api_md5)
+    ]
+
+    pbremote_overview(key_suffix="_det")
+    if st.button(":material/settings: Settings", key="pbremote_settings_btn"):
+        st.session_state.pbremote_view_mode = "settings"
+        st.rerun()
+    _in_detail = ("server" in st.session_state) or bool(monitor.servers)
+    if st.button(":material/description: Log", key="pbremote_server_back_btn") and _in_detail:
+        st.session_state.pop("server", None)
+        monitor.d_v7 = []
+        monitor.d_multi = []
+        monitor.d_single = []
+        monitor.servers = []
+        st.rerun()
+    if api_sync:
+        _sync_names = ", ".join(s.name for s in api_sync)
+        if st.button(":red[🔴 API not in sync]", key="pbremote_api_status_btn",
+                     help=f"Not in sync: {_sync_names} — Click to sync."):
+            pbremote.sync_api_up()
+            timeout = 180
+            _status = st.empty()
+            with st.spinner("Syncing API keys..."):
+                while not pbremote.check_if_api_synced():
+                    _status.caption(f"{timeout}s — {pbremote.unsynced_api} server(s) remaining")
+                    time.sleep(1)
+                    timeout -= 1
+                    if timeout == 0:
+                        break
+            _status.empty()
+            if timeout == 0:
+                st.error("API sync timed out")
+            else:
+                st.toast("API keys synced", icon="✅")
+            st.rerun()
+    else:
+        st.button(":green[🟢 API in sync]", key="pbremote_api_status_btn", disabled=True)
+    if st.button(":material/refresh:", key="pbremote_sidebar_refresh",
+                 help="Refresh remote server status"):
+        pbremote.update_remote_servers()
+        monitor.d_v7 = []
+        monitor.d_multi = []
+        monitor.d_single = []
+        st.rerun()
+    st.markdown("**Remote Servers**")
+    if st.button("View All Instances", key="pbremote_sidebar_all"):
+        if "server" in st.session_state:
+            del st.session_state.server
+        monitor.d_v7 = []
+        monitor.d_multi = []
+        monitor.d_single = []
+        monitor.servers = pbremote.remote_servers
+        st.rerun()
+    for rserver in sorted(pbremote.remote_servers, key=lambda s: s.name):
+        if rserver.is_online():
+            color = "green"
+            _v7  = [i.name for i in rserver.instances_status_v7.instances     if i.enabled_on == rserver.name]
+            _mul = [i.name for i in rserver.instances_status.instances         if i.enabled_on == rserver.name]
+            _sgl = [i.name for i in rserver.instances_status_single.instances  if i.enabled_on == rserver.name]
+            _tip_lines = []
+            if _v7:
+                _tip_lines += [f"V7 ({len(_v7)}):"] + [f"• {n}" for n in _v7] + [""]
+            if _mul:
+                _tip_lines += [f"Multi ({len(_mul)}):"] + [f"• {n}" for n in _mul] + [""]
+            if _sgl:
+                _tip_lines += [f"Single ({len(_sgl)}):"] + [f"• {n}" for n in _sgl] + [""]
+            _tip = "\n\n".join(_tip_lines) if _tip_lines else "No instances"
+        else:
+            color = "red"
+            _tip = "Offline"
+        _sc1, _sc2 = st.columns([4, 1])
+        with _sc1:
+            if st.button(f":{color}[{rserver.name}]", key=f"sidebar_srv_{rserver.name}",
+                         help=_tip):
                 monitor.d_v7 = []
                 monitor.d_multi = []
                 monitor.d_single = []
-                st.rerun()
-        with col2:
-            if st.button(":material/home:"):
-                del st.session_state.pbremote_details
-                st.rerun()
-        with col3:
-            if st.button(":material/save:"):
-                pbremote.save_config()
-        with col4:
-            if st.button(":material/edit:"):
-                st.session_state.monitor_edit = True
-                st.rerun()
-        st.markdown("""---""")
-        st.markdown("Remote Servers")
-        api_sync = []
-        if st.button(f'View All Instances'):
-            if "server" in st.session_state:
-                del st.session_state.server
-            monitor.d_v7 = []
-            monitor.d_multi = []
-            monitor.d_single = []
-            monitor.servers = st.session_state.pbremote.remote_servers
-            st.rerun()
-        for rserver in sorted(st.session_state.pbremote.remote_servers, key=lambda s: s.name):
-            if rserver.is_online():
-                color = "green"
-                if not rserver.is_api_md5_same(pbremote.api_md5):
-                    api_sync.append(rserver)
-            else: color = "red"
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                if st.button(f':{color}[{rserver.name}]'):
-                    monitor.d_v7 = []
-                    monitor.d_multi = []
-                    monitor.d_single = []
-                    st.session_state.server = rserver
-            with col2:
-                if color == "red":
-                    if st.button(":material/delete:", key=f"delete_{rserver.name}"):
-                        rserver.delete_server()
-                        pbremote.update_remote_servers()
-                        st.rerun()
-        sync_api()
-                
-    st.subheader("PBRemote Details")
-    pbremote_overview()
-    if pbremote.bucket:
-        if pbremote.bucket in pbremote.buckets:
-            buckets_index = pbremote.buckets.index(pbremote.bucket)
-        else: buckets_index = 0
-        if "bucket_config" not in st.session_state:
-            st.session_state.bucket_config = pbremote.fetch_bucket_config()
-    else: buckets_index = 0
-    if st.button("Add bucket", key="pbremote_bucket_add"):
-        pbremote.bucket = None
-        pbremote.bucket_region = None
-        pbremote.bucket_endpoint = None
-        pbremote.bucket_access_key_id = None
-        pbremote.bucket_secret_access_key = None
-        st.session_state.edit_bucket = True
-        st.rerun()
-    if pbremote.buckets:
-        col1, col2 = st.columns([1, 1], vertical_alignment='bottom')
-        with col1:
-            st.selectbox('Select bucket',pbremote.buckets, index = buckets_index, key="pbremote_bucket", help=pbgui_help.pbremote_bucket)
-        with col2:
-            if st.button("Edit", key="pbremote_bucket_edit"):
-                bucket_config = pbremote.fetch_bucket_config()
-                if bucket_config:
-                    st.session_state.edit_bucket = True
+                st.session_state.server = rserver
+        with _sc2:
+            if color == "red":
+                if st.button(":material/delete:", key=f"sidebar_del_{rserver.name}"):
+                    rserver.delete_server()
+                    pbremote.update_remote_servers()
                     st.rerun()
-    else:
-        if pbremote.rclone_installed:
-            st.write("No bucket found. Please configure rclone by using the 'Add bucket' button.")
+
+def pbremote_details():
+    pbremote = st.session_state.pbremote
+    if "monitor" not in st.session_state:
+        st.session_state.monitor = Monitor()
+    monitor = st.session_state.monitor
+
+    if "pbremote_view_mode" not in st.session_state:
+        st.session_state.pbremote_view_mode = "viewer"
+
+    if st.session_state.pbremote_view_mode == "settings":
+        with st.sidebar:
+            if st.button(":material/arrow_back: Back", key="pbremote_back_btn"):
+                st.session_state.pbremote_view_mode = "viewer"
+                st.rerun()
+
+        # ── Bucket section ───────────────────────────────────────────────────
+        st.markdown("**Bucket**")
+
+        # Sync bucket selectbox → model
+        if "pbremote_bucket" in st.session_state:
+            if st.session_state.pbremote_bucket != pbremote.bucket:
+                pbremote.bucket = st.session_state.pbremote_bucket
+                pbremote.fetch_bucket_config()
+
+        # Determine bucket index
+        if pbremote.bucket and pbremote.bucket in pbremote.buckets:
+            buckets_index = pbremote.buckets.index(pbremote.bucket)
         else:
-            st.write("rclone not installed. Please install rclone.")
-            st.info("Go to VPS Manager, select your local system and install rclone.")
-    if st.checkbox("Show logfile", key="pbremote_log"):
-        st.session_state.pbgui_instances.view_log("PBRemote")
-    if len(api_sync) > 0:
-        api_sync_list = []
-        for api in api_sync:
-            api_sync_list.append(api.name)
-        st.subheader("API not in sync with remote servers:")
-        st.write(f"{api_sync_list}")
+            buckets_index = 0
+
+        _bc1, _bc2 = st.columns([3, 1])
+        with _bc1:
+            if pbremote.buckets:
+                st.selectbox("Select bucket", pbremote.buckets, index=buckets_index,
+                             key="pbremote_bucket", help=pbgui_help.pbremote_bucket)
+        with _bc2:
+            if st.button(":material/add: Add bucket", key="pbremote_bucket_add"):
+                pbremote.bucket = None
+                pbremote.bucket_region = None
+                pbremote.bucket_endpoint = None
+                pbremote.bucket_access_key_id = None
+                pbremote.bucket_secret_access_key = None
+                for k in ["pbremote_edit_bucket_name", "pbremote_edit_region",
+                          "pbremote_edit_endpoint", "pbremote_edit_access_key",
+                          "pbremote_edit_secret_key"]:
+                    st.session_state.pop(k, None)
+                st.session_state["pbremote_show_bucket_edit"] = True
+                st.rerun()
+            if pbremote.buckets:
+                if st.button(":material/edit: Edit", key="pbremote_bucket_edit_btn"):
+                    pbremote.fetch_bucket_config()
+                    st.session_state["pbremote_show_bucket_edit"] = True
+                    st.rerun()
+
+        if not pbremote.buckets:
+            if pbremote.rclone_installed:
+                st.info("No bucket found. Click **Add bucket** to configure rclone.")
+            else:
+                st.warning("rclone not installed. Go to VPS Manager → install rclone on your local system.")
+
+        # Inline bucket edit form (conditional)
+        if st.session_state.get("pbremote_show_bucket_edit"):
+            with st.container(border=True):
+                st.caption(
+                    "1. Get your free 15 GB account at [Synology C2](https://c2.synology.com/en-uk/object-storage/overview).  \n"
+                    "2. Create a bucket · fill in details · Save · Test."
+                )
+                # Snapshot of saved values — set once when form opens, reset after save
+                if "_bucket_saved_snapshot" not in st.session_state:
+                    st.session_state["_bucket_saved_snapshot"] = {
+                        "name":       pbremote.bucket[:-1] if pbremote.bucket else "",
+                        "region":     pbremote.bucket_region or "",
+                        "endpoint":   pbremote.bucket_endpoint or "",
+                        "access_key": pbremote.bucket_access_key_id or "",
+                        "secret_key": pbremote.bucket_secret_access_key or "",
+                    }
+
+                # Sync session state → model
+                for _wk, _attr in [
+                    ("pbremote_edit_bucket_name", None),
+                    ("pbremote_edit_region",      "bucket_region"),
+                    ("pbremote_edit_endpoint",    "bucket_endpoint"),
+                    ("pbremote_edit_access_key",  "bucket_access_key_id"),
+                    ("pbremote_edit_secret_key",  "bucket_secret_access_key"),
+                ]:
+                    if _attr and _wk in st.session_state:
+                        if getattr(pbremote, _attr) != st.session_state[_wk]:
+                            setattr(pbremote, _attr, st.session_state[_wk])
+
+                _bucket_name_val = pbremote.bucket[:-1] if pbremote.bucket else ""
+                st.text_input("Bucket name", value=_bucket_name_val, key="pbremote_edit_bucket_name")
+                _ef1, _ef2, _ef3, _ef4 = st.columns(4)
+                with _ef1:
+                    st.text_input("Region", value=pbremote.bucket_region or "", key="pbremote_edit_region")
+                with _ef2:
+                    st.text_input("Endpoint", value=pbremote.bucket_endpoint or "", key="pbremote_edit_endpoint")
+                with _ef3:
+                    st.text_input("Access Key ID", value=pbremote.bucket_access_key_id or "", key="pbremote_edit_access_key")
+                with _ef4:
+                    st.text_input("Secret Access Key", value=pbremote.bucket_secret_access_key or "",
+                                  type="password", key="pbremote_edit_secret_key")
+
+                # Dirty detection: compare widget values against snapshot
+                _bsnap = st.session_state["_bucket_saved_snapshot"]
+                _bucket_dirty = (
+                    st.session_state.get("pbremote_edit_bucket_name", _bsnap["name"]) != _bsnap["name"] or
+                    st.session_state.get("pbremote_edit_region",      _bsnap["region"]) != _bsnap["region"] or
+                    st.session_state.get("pbremote_edit_endpoint",    _bsnap["endpoint"]) != _bsnap["endpoint"] or
+                    st.session_state.get("pbremote_edit_access_key",  _bsnap["access_key"]) != _bsnap["access_key"] or
+                    st.session_state.get("pbremote_edit_secret_key",  _bsnap["secret_key"]) != _bsnap["secret_key"]
+                )
+
+                # Apply bucket name from widget before save/test
+                def _apply_bucket_fields():
+                    name = st.session_state.get("pbremote_edit_bucket_name", "").strip()
+                    pbremote.bucket = (name + ":") if name else None
+                    pbremote.bucket_region = st.session_state.get("pbremote_edit_region", "")
+                    pbremote.bucket_endpoint = st.session_state.get("pbremote_edit_endpoint", "")
+                    pbremote.bucket_access_key_id = st.session_state.get("pbremote_edit_access_key", "")
+                    pbremote.bucket_secret_access_key = st.session_state.get("pbremote_edit_secret_key", "")
+
+                _ba1, _ba2, _ba3, _ba4 = st.columns(4)
+                with _ba1:
+                    if st.button(":material/save:", key="pbremote_bucket_save",
+                                 type="primary" if _bucket_dirty else "secondary"):
+                        _apply_bucket_fields()
+                        ok, result = pbremote.save_bucket_config()
+                        if ok:
+                            pbremote.fetch_buckets()
+                            st.session_state.pop("pbremote_show_bucket_edit", None)
+                            st.session_state.pop("_bucket_saved_snapshot", None)
+                            result_popup("Bucket saved", result)
+                        else:
+                            st.error(result)
+                with _ba2:
+                    if st.button(":material/lan: Test Connection", key="pbremote_bucket_test"):
+                        _apply_bucket_fields()
+                        ok, result = pbremote.test_bucket()
+                        if ok:
+                            result_popup("Connection successful", result)
+                        else:
+                            st.error(result)
+                with _ba3:
+                    if pbremote.buckets and st.button(":material/delete: Delete", key="pbremote_bucket_delete"):
+                        ok, result = pbremote.delete_bucket()
+                        if ok:
+                            pbremote.fetch_buckets()
+                            st.session_state.pop("pbremote_show_bucket_edit", None)
+                            st.session_state.pop("_bucket_saved_snapshot", None)
+                            result_popup("Bucket deleted", result)
+                        else:
+                            st.error(result)
+                with _ba4:
+                    if st.button(":material/close: Cancel", key="pbremote_bucket_cancel"):
+                        st.session_state.pop("pbremote_show_bucket_edit", None)
+                        st.session_state.pop("_bucket_saved_snapshot", None)
+                        st.rerun()
+
+        st.markdown("---")
+
+        # ── Monitor Settings section ─────────────────────────────────────────
+        st.markdown("**Monitor Settings**")
+
+        _MC_FIELDS = [
+            'mem_warning_server', 'mem_error_server', 'swap_warning_server', 'swap_error_server',
+            'disk_warning_server', 'disk_error_server', 'cpu_warning_server', 'cpu_error_server',
+            'mem_warning_v7', 'mem_error_v7', 'swap_warning_v7', 'swap_error_v7',
+            'cpu_warning_v7', 'cpu_error_v7', 'error_warning_v7', 'error_error_v7',
+            'traceback_warning_v7', 'traceback_error_v7',
+            'mem_warning_multi', 'mem_error_multi', 'swap_warning_multi', 'swap_error_multi',
+            'cpu_warning_multi', 'cpu_error_multi', 'error_warning_multi', 'error_error_multi',
+            'traceback_warning_multi', 'traceback_error_multi',
+            'mem_warning_single', 'mem_error_single', 'swap_warning_single', 'swap_error_single',
+            'cpu_warning_single', 'cpu_error_single', 'error_warning_single', 'error_error_single',
+            'traceback_warning_single', 'traceback_error_single',
+        ]
+        # Snapshot before edit_monitor_config syncs widgets → model (only init once, reset after save)
+        if "_monitor_saved_snapshot" not in st.session_state:
+            _mc = monitor.monitor_config
+            st.session_state["_monitor_saved_snapshot"] = {f: getattr(_mc, f) for f in _MC_FIELDS}
+
+        monitor.edit_monitor_config(show_navigation=False)
+
+        # After sync: model == widget values; compare against saved snapshot
+        _snap = st.session_state["_monitor_saved_snapshot"]
+        _mc_dirty = any(
+            abs(getattr(monitor.monitor_config, f) - _snap[f]) > 1e-9
+            for f in _MC_FIELDS
+        )
+        with st.sidebar:
+            if st.button(":material/save:", key="pbremote_save_monitor",
+                         type="primary" if _mc_dirty else "secondary"):
+                monitor.monitor_config.save_monitor_config()
+                st.session_state["_monitor_saved_snapshot"] = {
+                    f: getattr(monitor.monitor_config, f) for f in _MC_FIELDS
+                }
+                st.rerun()
+        return
+
+    # ── Server panel ────────────────────────────────────────────────────────
     if "server" in st.session_state:
         monitor.server = st.session_state.server
         monitor.view_server()
-        monitor.servers = []
-        monitor.servers.append(monitor.server)
+        monitor.servers = [monitor.server]
         monitor.view_server_instances()
     elif monitor.servers:
         monitor.view_server_instances()
     else:
-        st.info("Please select a remote server from the sidebar to view details.")
-
-def edit_bucket():
-    # Init PBRemote
-    pbremote = st.session_state.pbremote
-    # Init keys from session_state
-    if "pbremote_bucket_name" in st.session_state:
-        if st.session_state.pbremote_bucket_name + ":" != pbremote.bucket:
-            pbremote.bucket = st.session_state.pbremote_bucket_name + ":"
-    if "pbremote_bucket_region" in st.session_state:
-        if st.session_state.pbremote_bucket_region != pbremote.bucket_region:
-            pbremote.bucket_region = st.session_state.pbremote_bucket_region
-    if "pbremote_bucket_endpoint" in st.session_state:
-        if st.session_state.pbremote_bucket_endpoint != pbremote.bucket_endpoint:
-            pbremote.bucket_endpoint = st.session_state.pbremote_bucket_endpoint
-    if "pbremote_bucket_access_key" in st.session_state:
-        if st.session_state.pbremote_bucket_access_key != pbremote.bucket_access_key_id:
-            pbremote.bucket_access_key_id = st.session_state.pbremote_bucket_access_key
-    if "pbremote_bucket_secret_key" in st.session_state:
-        if st.session_state.pbremote_bucket_secret_key != pbremote.bucket_secret_access_key:
-            pbremote.bucket_secret_access_key = st.session_state.pbremote_bucket_secret_key
-    # Navigation
-    with st.sidebar:
-        if st.button(":back:", key="button_edit_bucket_back"):
-            del st.session_state.edit_bucket
-            st.rerun()
-        if st.button(":material/save:"):
-            ok, result = pbremote.save_bucket_config()
-            if ok:
-                result_popup("Bucket saved", result)
-                pbremote.fetch_buckets()
-            else:
-                error_popup(result)
-        if st.button(":material/delete:"):
-            ok, result = pbremote.delete_bucket()
-            if ok:
-                result_popup("Bucket deleted", result)
-                pbremote.fetch_buckets()
-                del st.session_state.edit_bucket
-            else:
-                error_popup(result)
-
-    # Instructions and link to Synology        
-    st.write(
-        "1. Get your free 15GB account at [Synology C2](https://c2.synology.com/en-uk/object-storage/overview).\n"
-        "2. Create a bucket in your C2 Object Storage.\n"
-        "3. Fill in the details below.\n"
-        "4. Save the config.\n"
-        "5. Test the connection.\n"
-        "6. Go back and save the settings.\n"
-    )
-   
-    # Display
-    if pbremote.bucket:
-        bucket_name = pbremote.bucket[0:-1]
-    else:
-        bucket_name = ""
-    st.text_input("Bucket name", value=bucket_name, key="pbremote_bucket_name")
-    col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
-    with col1:
-        st.text_input("region", value=pbremote.bucket_region, key="pbremote_bucket_region")
-    with col2:
-        st.text_input("endpoint", value=pbremote.bucket_endpoint, key="pbremote_bucket_endpoint")
-    with col3:
-        st.text_input("access_key_id", value=pbremote.bucket_access_key_id, key="pbremote_bucket_access_key")
-    with col4:
-        st.text_input("secret_access_key", value=pbremote.bucket_secret_access_key, type="password", key="pbremote_bucket_secret_key")
-    if st.button("Test Connection"):
-        ok, result = pbremote.test_bucket()
-        if ok:
-            result_popup("Connection successful", result)
-        else:
-            error_popup(result)
-    st.info("Save your config before testing the connection.")
+        render_log_viewer(preselect="PBRemote.log", iframe_height_offset=280)
 
 @st.dialog("Info", width="large")
 def result_popup(message, result):
@@ -424,385 +543,53 @@ def result_popup(message, result):
 
 def pbmon_details():
     pbmon = st.session_state.pbmon
-    # Navigation
-    with st.sidebar:
-        if st.button(":back:", key="button_pbmon_back"):
-            del st.session_state.pbmon_details
-            st.rerun()
-    st.subheader("PBMon Details")
-    pbmon_overview()
 
-    if "pbmon_telegram_token" in st.session_state:
-        if st.session_state.pbmon_telegram_token != pbmon.telegram_token:
-            pbmon.telegram_token = st.session_state.pbmon_telegram_token
-    else:
-        st.session_state.pbmon_telegram_token = pbmon.telegram_token
+    if "pbmon_view_mode" not in st.session_state:
+        st.session_state.pbmon_view_mode = "viewer"
 
-    if "pbmon_telegram_chat_id" in st.session_state:
-        if st.session_state.pbmon_telegram_chat_id != pbmon.telegram_chat_id:
-            pbmon.telegram_chat_id = st.session_state.pbmon_telegram_chat_id
-    else:
-        st.session_state.pbmon_telegram_chat_id = pbmon.telegram_chat_id
-
-    st.text_input("Telegram Bot Token", type="password", key="pbmon_telegram_token", help=pbgui_help.pbmon_telegram_token)
-    st.text_input("Telegram Chat ID", key="pbmon_telegram_chat_id", help=pbgui_help.pbmon_telegram_chat_id)
-
-    if st.checkbox("Show logfile", key="pbmon_log"):
-        st.session_state.pbgui_instances.view_log("PBMon")
-
-def pbstat_details():
-    # Navigation
-    with st.sidebar:
-        if st.button(":back:", key="button_pbstat_back"):
-            del st.session_state.pbstat_details
-            st.rerun()
-    st.subheader("PBStat Details")
-    pbstat_overview()
-    if st.checkbox("Show logfile", key="pbstat_log"):
-        st.session_state.pbgui_instances.view_log("PBStat")
-
-def pbdata_details():
-    pbdata = st.session_state.pbdata
-    # Callback for refresh button to avoid manual save/restore of session flags
-    def _pbdata_refresh_callback():
-        try:
-            st.session_state.users.load()
-        except Exception:
-            pass
-    # Navigation
-    with st.sidebar:
-        col1, col2 = st.columns([1,1])
-        with col1:
-            st.button(":material/refresh:", key="button_pbdata_refresh", on_click=_pbdata_refresh_callback)
-        with col2:
-            if st.button(":back:", key="button_pbdata_back"):
-                del st.session_state.pbdata_details
+    if st.session_state.pbmon_view_mode == "settings":
+        with st.sidebar:
+            if st.button(":material/arrow_back: Back", key="pbmon_back_btn"):
+                st.session_state.pbmon_view_mode = "viewer"
                 st.rerun()
 
-    st.subheader("PBData Details")
+        if "pbmon_telegram_token" not in st.session_state:
+            st.session_state.pbmon_telegram_token = pbmon.telegram_token
+        if "pbmon_telegram_chat_id" not in st.session_state:
+            st.session_state.pbmon_telegram_chat_id = pbmon.telegram_chat_id
 
-    pbdata_overview()
-    users = st.session_state.users
+        st.text_input("Telegram Bot Token", type="password", key="pbmon_telegram_token", help=pbgui_help.pbmon_telegram_token)
+        st.text_input("Telegram Chat ID", key="pbmon_telegram_chat_id", help=pbgui_help.pbmon_telegram_chat_id)
 
-    if "pbdata_users" in st.session_state:
-        if st.session_state.pbdata_users != pbdata.fetch_users:
-            pbdata.fetch_users = st.session_state.pbdata_users
-    st.multiselect(
-        'Users',
-        users.list(),
-        default=pbdata.fetch_users,
-        key="pbdata_users",
-        help='Users PBData will actively fetch/update (WS + shared REST pollers).',
-    )
-
-    # Separate selection for executions/trades downloading (stored in trades DB)
-    # Streamlit keeps widget values in session_state across reruns. If trades_users
-    # is not configured yet, ensure the widget starts empty (opt-in behavior).
-    try:
-        _raw_trades_cfg = load_ini('pbdata', 'trades_users')
-        _trades_cfg_set = bool(str(_raw_trades_cfg).strip()) if _raw_trades_cfg is not None else False
-    except Exception:
-        _trades_cfg_set = False
-
-    # One-time reset of stale widget values when INI has no trades_users.
-    # Do NOT delete on every rerun, otherwise user selections can never persist.
-    if "_pbdata_trades_users_reset_done" not in st.session_state:
-        st.session_state["_pbdata_trades_users_reset_done"] = False
-    if not _trades_cfg_set and not st.session_state.get("_pbdata_trades_users_reset_done", False):
-        st.session_state["pbdata_trades_users"] = []
-        st.session_state["_pbdata_trades_users_reset_done"] = True
-
-    try:
-        trades_default = pbdata.trades_users
-    except Exception:
-        trades_default = []
-    st.multiselect(
-        'Executions download',
-        users.list(),
-        default=trades_default,
-        key="pbdata_trades_users",
-        help='Opt-in list: only these users will download/store executions (my trades) via PBData. Default is none.',
-    )
-
-    # Persist selection to pbgui.ini via PBData setter
-    try:
-        selected_trades_users = st.session_state.get("pbdata_trades_users", [])
-        if selected_trades_users != getattr(pbdata, 'trades_users', []):
-            pbdata.trades_users = selected_trades_users
-    except Exception:
-        pass
-
-    def _pbdata_log_level_widget():
-        # PBData log level persisted under [pbdata] log_level
-        try:
-            current_ll = load_ini('pbdata', 'log_level')
-            if isinstance(current_ll, str) and current_ll.strip() != '':
-                cur_ll_val = current_ll.strip().upper()
-            else:
-                cur_ll_val = None
-        except Exception:
-            cur_ll_val = None
-
-        ll_options = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL', 'NONE']
-        default_ll = cur_ll_val if cur_ll_val is not None else 'INFO'
-        st.selectbox(
-            'PBData Log level',
-            ll_options,
-            index=ll_options.index(default_ll) if default_ll in ll_options else 1,
-            key='pbdata_log_level_select',
-            help='Minimum log level for PBData (messages below this level are suppressed).',
+        _pbmon_dirty = (
+            st.session_state.get("pbmon_telegram_token", pbmon.telegram_token) != (pbmon.telegram_token or "") or
+            st.session_state.get("pbmon_telegram_chat_id", pbmon.telegram_chat_id) != (pbmon.telegram_chat_id or "")
         )
-        if 'pbdata_log_level_select' in st.session_state and st.session_state['pbdata_log_level_select'] != cur_ll_val:
-            try:
-                v = st.session_state['pbdata_log_level_select']
-                if v == 'NONE':
-                    save_ini('pbdata', 'log_level', '')
-                else:
-                    save_ini('pbdata', 'log_level', v)
-                st.success('Saved log_level setting to pbgui.ini')
-            except Exception as e:
-                st.error(f'Failed to save log_level: {e}')
+        with st.sidebar:
+            if st.button(":material/save:", key="pbmon_save_config", type="primary" if _pbmon_dirty else "secondary"):
+                pbmon.telegram_token = st.session_state.pbmon_telegram_token
+                pbmon.telegram_chat_id = st.session_state.pbmon_telegram_chat_id
+                st.rerun()
+        return
+
+    with st.sidebar:
+        if st.button(":material/settings: Settings", key="pbmon_settings_btn"):
+            st.session_state.pbmon_view_mode = "settings"
             st.rerun()
 
-    # Show PBData logfile (filtered viewer) with log level selector next to Logfiles
-    view_log_filtered("PBData", header_right_fn=_pbdata_log_level_widget)
+    render_log_viewer(preselect="PBMon.log", iframe_height_offset=280)
 
-    # -----------------------------
-    # PBData timers
-    # -----------------------------
+def pbstat_details():
+    render_log_viewer(preselect="PBStat.log", iframe_height_offset=280)
 
 
-    def _read_int_ini(section: str, key: str):
-        try:
-            v = load_ini(section, key)
-            s = str(v).strip() if v is not None else ''
-            if s == '':
-                return None
-            return int(float(s))
-        except Exception:
-            return None
-
-    def _read_float_ini(section: str, key: str):
-        try:
-            v = load_ini(section, key)
-            s = str(v).strip() if v is not None else ''
-            if s == '':
-                return None
-            return float(s)
-        except Exception:
-            return None
-
-    # Defaults from running PBData instance
+def _render_pbdata_status_tab():
+    """Render the PBData fetch summary for the Status tab."""
     try:
-        _def_pollers_delay = int(getattr(pbdata, '_pollers_delay_seconds', 60))
-    except Exception:
-        _def_pollers_delay = 60
-    try:
-        _def_combined = int(getattr(pbdata, '_shared_combined_interval_seconds', 90))
-    except Exception:
-        _def_combined = 90
-    try:
-        _def_history = int(getattr(pbdata, '_shared_history_interval_seconds', 90))
-    except Exception:
-        _def_history = 90
-    try:
-        _def_exec = int(getattr(pbdata, '_shared_executions_interval_seconds', 1800))
-    except Exception:
-        _def_exec = 1800
-    try:
-        _def_rest_pause = float(getattr(pbdata, '_shared_rest_user_pause', 0.75))
-    except Exception:
-        _def_rest_pause = 0.75
-
-    cur_ws_val = _read_int_ini('pbdata', 'ws_max')
-    default_ws = cur_ws_val if cur_ws_val is not None else MAX_PRIVATE_WS_GLOBAL
-
-    cur_pollers_delay = _read_int_ini('pbdata', 'pollers_delay_seconds')
-    cur_combined = _read_int_ini('pbdata', 'poll_interval_combined_seconds')
-    cur_history = _read_int_ini('pbdata', 'poll_interval_history_seconds')
-    cur_exec = _read_int_ini('pbdata', 'poll_interval_executions_seconds')
-    cur_rest_pause = _read_float_ini('pbdata', 'shared_rest_user_pause_seconds')
-
-    with st.expander('PBData timers', expanded=False):
-        r1 = st.columns(4)
-        with r1[0]:
-            ws_max = st.number_input(
-                'Max private WS global',
-                min_value=0,
-                value=default_ws,
-                step=1,
-                key='pbdata_ws_max_input',
-                help=pbgui_help.pbdata_ws_max,
-            )
-        with r1[1]:
-            pollers_delay_val = st.number_input(
-                'Startup delay (s)',
-                min_value=0,
-                value=cur_pollers_delay if cur_pollers_delay is not None else _def_pollers_delay,
-                step=5,
-                key='pbdata_pollers_delay_seconds_input',
-                help='Grace period before starting shared REST pollers to avoid startup bursts.',
-            )
-        with r1[2]:
-            combined_val = st.number_input(
-                'Combined interval (s)',
-                min_value=10,
-                value=cur_combined if cur_combined is not None else _def_combined,
-                step=10,
-                key='pbdata_poll_interval_combined_input',
-                help='Interval for shared combined REST poller (balances/positions/orders).',
-            )
-        with r1[3]:
-            history_val = st.number_input(
-                'History interval (s)',
-                min_value=10,
-                value=cur_history if cur_history is not None else _def_history,
-                step=10,
-                key='pbdata_poll_interval_history_input',
-                help='Interval for shared history REST poller.',
-            )
-
-        r2 = st.columns(4)
-        with r2[0]:
-            exec_val = st.number_input(
-                'Executions interval (s)',
-                min_value=60,
-                value=cur_exec if cur_exec is not None else _def_exec,
-                step=60,
-                key='pbdata_poll_interval_executions_input',
-                help='Interval for shared executions (my trades) REST poller.',
-            )
-        with r2[1]:
-            rest_pause_val = st.number_input(
-                'REST pause/user (s)',
-                min_value=0.0,
-                value=cur_rest_pause if cur_rest_pause is not None else _def_rest_pause,
-                step=0.05,
-                key='pbdata_shared_rest_user_pause_input',
-                help='Small pause between users in shared REST pollers to reduce rate limits.',
-            )
-        with r2[2]:
-            st.write('')
-        with r2[3]:
-            st.write('')
-
-        # Per-exchange overrides (stored in INI as JSON, but edited as number inputs)
-        try:
-            raw_json = load_ini('pbdata', 'shared_rest_pause_by_exchange_json')
-            sval = str(raw_json).strip() if raw_json is not None else ''
-            ini_overrides = json.loads(sval) if sval != '' else {}
-            if not isinstance(ini_overrides, dict):
-                ini_overrides = {}
-        except Exception:
-            ini_overrides = {}
-
-        with st.expander('Shared REST pause per exchange', expanded=False):
-            st.caption('Per-exchange pause between users. Defaults come from PBData (e.g. hyperliquid/bybit) unless you set an override; only differences vs the global pause are saved as overrides.')
-            exchange_ids = []
-            try:
-                exchange_ids = Exchanges.list()
-            except Exception:
-                exchange_ids = []
-            try:
-                exchange_ids = sorted([str(x) for x in exchange_ids if str(x).strip() != ''])
-            except Exception:
-                exchange_ids = [str(x) for x in exchange_ids]
-
-            # 4 per row, to keep UI compact
-            cols_per_row = 4
-            for i in range(0, len(exchange_ids), cols_per_row):
-                row = exchange_ids[i:i + cols_per_row]
-                cols = st.columns(cols_per_row)
-                for col, exid_str in zip(cols, row):
-                    value_key = f'pbdata_rest_pause_ex_{exid_str}'
-                    try:
-                        if exid_str in ini_overrides:
-                            default_val = float(ini_overrides.get(exid_str))
-                        else:
-                            # Fall back to PBData's built-in defaults (e.g. hyperliquid/bybit)
-                            try:
-                                per_ex_defaults = getattr(pbdata, '_shared_rest_pause_by_exchange', {}) or {}
-                                if isinstance(per_ex_defaults, dict) and exid_str in per_ex_defaults:
-                                    default_val = float(per_ex_defaults.get(exid_str))
-                                else:
-                                    default_val = float(rest_pause_val)
-                            except Exception:
-                                default_val = float(rest_pause_val)
-                    except Exception:
-                        default_val = float(rest_pause_val)
-
-                    # Streamlit keeps number_input values in session_state.
-                    # If the widget was previously initialized to the global pause
-                    # (e.g. 0.75) and there's still no INI override, bump it to the
-                    # per-exchange built-in default so hyperliquid/bybit show 3.0.
-                    try:
-                        if exid_str not in ini_overrides and value_key in st.session_state:
-                            cur_v = float(st.session_state.get(value_key))
-                            if abs(cur_v - float(rest_pause_val)) < 1e-9 and abs(float(default_val) - float(rest_pause_val)) > 1e-9:
-                                st.session_state[value_key] = float(default_val)
-                    except Exception:
-                        pass
-                    with col:
-                        st.number_input(
-                            f'{exid_str} (s)',
-                            min_value=0.0,
-                            value=float(default_val),
-                            step=0.05,
-                            key=value_key,
-                            help='Per-exchange pause (seconds) between users for shared REST pollers. Only values differing from the global pause are saved as overrides.',
-                        )
-
-        if st.button('Save PBData timers', key='pbdata_save_timers_btn'):
-            try:
-                save_ini('pbdata', 'ws_max', str(int(ws_max)))
-                save_ini('pbdata', 'pollers_delay_seconds', str(int(pollers_delay_val)))
-                save_ini('pbdata', 'poll_interval_combined_seconds', str(int(combined_val)))
-                save_ini('pbdata', 'poll_interval_history_seconds', str(int(history_val)))
-                save_ini('pbdata', 'poll_interval_executions_seconds', str(int(exec_val)))
-                save_ini('pbdata', 'shared_rest_user_pause_seconds', str(float(rest_pause_val)))
-            except Exception as e:
-                st.error(f'Failed saving PBData timers: {e}')
-                st.stop()
-
-            # Build per-exchange overrides from number inputs.
-            # Only persist values which differ from the global pause.
-            try:
-                cleaned = {}
-                for exid in Exchanges.list():
-                    exid_str = str(exid)
-                    value_key = f'pbdata_rest_pause_ex_{exid_str}'
-                    try:
-                        v = float(st.session_state.get(value_key, rest_pause_val))
-                    except Exception:
-                        v = float(rest_pause_val)
-                    try:
-                        if abs(v - float(rest_pause_val)) > 1e-9:
-                            cleaned[exid_str] = v
-                    except Exception:
-                        pass
-                if cleaned:
-                    save_ini('pbdata', 'shared_rest_pause_by_exchange_json', json.dumps(cleaned))
-                else:
-                    # Clear overrides when none are enabled
-                    save_ini('pbdata', 'shared_rest_pause_by_exchange_json', '')
-            except Exception as e:
-                st.error(f'Failed saving per-exchange overrides: {e}')
-                st.stop()
-            st.success('Saved PBData timers to pbgui.ini')
-            st.rerun()
-
-    # Show fetch summary JSON (generated by PBData)
-    try:
-        # Note: fragment reruns are triggered automatically by widget
-        # interactions inside the fragment. No explicit invalidate helper
-        # is required — clicking the button below will rerun only the
-        # fragment in Streamlit >=1.51.0.
-
         summary_path = Path(f"{PBGDIR}/data/logs/fetch_summary.json")
         if summary_path.exists():
             @st.fragment
             def render_fetch_summary():
-                # Reload the file on each fragment rerun so the refresh button picks up changes
                 try:
                     with open(summary_path, 'r') as sf:
                         try:
@@ -816,9 +603,7 @@ def pbdata_details():
                     st.info('No fetch summary available yet. Start PBData or wait for the next summary cycle.')
                     return
 
-                # Place a small refresh button to invalidate only this fragment
                 col_l, col_r = st.columns([1, 0.12])
-                # Compute seconds since the summary timestamp (if present)
                 secs_str = ''
                 try:
                     ts_str = summary_obj.get('timestamp') if isinstance(summary_obj, dict) else None
@@ -833,14 +618,12 @@ def pbdata_details():
                 with col_r:
                     st.button(":material/refresh:", key="button_fetch_summary_refresh")
 
-                # Prepare table data: one row per user with columns for each category
                 bal = summary_obj.get('balances', {})
                 pos = summary_obj.get('positions', {})
                 ords = summary_obj.get('orders', {})
                 hist = summary_obj.get('history', [])
                 execs = summary_obj.get('executions', [])
 
-                # Show counts of ws vs rest for each category
                 try:
                     bal_ws = len(bal.get('ws') or [])
                     bal_rest = len(bal.get('rest') or [])
@@ -869,7 +652,6 @@ def pbdata_details():
                 except Exception:
                     pass
 
-                # Build set of all users
                 users_set = set()
                 users_set.update(bal.get('ws', []) or [])
                 users_set.update(bal.get('rest', []) or [])
@@ -909,10 +691,6 @@ def pbdata_details():
                         'executions': f"{exec_status} ({fmt_minutes(lf.get('executions'))})" if exec_status else '',
                     })
 
-                # Filters and details: collapse into an expander for a cleaner view
-                # Do not force `expanded=False` here — letting Streamlit manage
-                # the expander state preserves the user's open/closed choice
-                # across fragment/page reruns (e.g. when pressing refresh).
                 with st.expander("Details"):
                     st.markdown('**Filters:**')
                     fcol1, fcol2, fcol3 = st.columns([1,1,1])
@@ -923,7 +701,6 @@ def pbdata_details():
                     with fcol3:
                         show_ord_ws = st.checkbox('Orders WS only', value=False, help='Show only users currently updated via websocket for orders.')
 
-                    # Apply filter
                     def matches(row):
                         if show_bal_ws and not str(row.get('balances','')).startswith('ws'):
                             return False
@@ -935,7 +712,6 @@ def pbdata_details():
 
                     filtered = [r for r in rows if matches(r)]
 
-                    # Render table (always include history + executions columns)
                     if filtered:
                         def color_for_minutes(mins_text):
                             try:
@@ -1009,17 +785,559 @@ def pbdata_details():
     except Exception as e:
         st.error(f'Failed to load fetch summary: {e}')
 
+
+def pbdata_details():
+    pbdata = st.session_state.pbdata
+    users = st.session_state.users
+
+    # ── Helper functions for reading INI values ──────────────────────────────
+    def _read_int_ini(section: str, key: str):
+        try:
+            v = load_ini(section, key)
+            s = str(v).strip() if v is not None else ''
+            if s == '':
+                return None
+            return int(float(s))
+        except Exception:
+            return None
+
+    def _read_float_ini(section: str, key: str):
+        try:
+            v = load_ini(section, key)
+            s = str(v).strip() if v is not None else ''
+            if s == '':
+                return None
+            return float(s)
+        except Exception:
+            return None
+
+    if "pbdata_view_mode" not in st.session_state:
+        st.session_state.pbdata_view_mode = "viewer"
+
+    if st.session_state.pbdata_view_mode == "settings":
+        # Reload users from disk so newly added API keys appear immediately
+        try:
+            users.load()
+        except Exception:
+            pass
+
+        with st.sidebar:
+            if st.button(":material/arrow_back: Back", key="pbdata_back_btn"):
+                st.session_state.pbdata_view_mode = "viewer"
+                st.rerun()
+
+        # Users multiselect
+        if "pbdata_users" not in st.session_state:
+            st.session_state.pbdata_users = list(pbdata.fetch_users or [])
+        st.multiselect(
+            'Users',
+            users.list(),
+            key="pbdata_users",
+            help='Users PBData will actively fetch/update (WS + shared REST pollers).',
+        )
+
+        # Executions/trades users
+        try:
+            _raw_trades_cfg = load_ini('pbdata', 'trades_users')
+            _trades_cfg_set = bool(str(_raw_trades_cfg).strip()) if _raw_trades_cfg is not None else False
+        except Exception:
+            _trades_cfg_set = False
+
+        if "_pbdata_trades_users_reset_done" not in st.session_state:
+            st.session_state["_pbdata_trades_users_reset_done"] = False
+        if not _trades_cfg_set and not st.session_state.get("_pbdata_trades_users_reset_done", False):
+            st.session_state["pbdata_trades_users"] = []
+            st.session_state["_pbdata_trades_users_reset_done"] = True
+
+        try:
+            trades_default = pbdata.trades_users if "pbdata_trades_users" not in st.session_state else st.session_state["pbdata_trades_users"]
+        except Exception:
+            trades_default = []
+        st.multiselect(
+            'Executions download',
+            users.list(),
+            default=trades_default,
+            key="pbdata_trades_users",
+            help='Opt-in list: only these users will download/store executions (my trades) via PBData. Default is none.',
+        )
+
+        # Log level (no auto-save — saved with the Save button below)
+        try:
+            current_ll = load_ini('pbdata', 'log_level')
+            cur_ll_val = current_ll.strip().upper() if isinstance(current_ll, str) and current_ll.strip() else 'INFO'
+        except Exception:
+            cur_ll_val = 'INFO'
+        ll_options = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL', 'NONE']
+        if "pbdata_log_level_select" not in st.session_state:
+            st.session_state["pbdata_log_level_select"] = cur_ll_val if cur_ll_val in ll_options else 'INFO'
+        st.selectbox(
+            'Log level',
+            ll_options,
+            key='pbdata_log_level_select',
+            help='Minimum log level for PBData (messages below this level are suppressed).',
+        )
+
+        st.markdown("---")
+
+        # ── Timers ───────────────────────────────────────────────────────────
+        st.markdown("**Timers**")
+        try:
+            _def_pollers_delay = int(getattr(pbdata, '_pollers_delay_seconds', 60))
+        except Exception:
+            _def_pollers_delay = 60
+        try:
+            _def_combined = int(getattr(pbdata, '_shared_combined_interval_seconds', 90))
+        except Exception:
+            _def_combined = 90
+        try:
+            _def_history = int(getattr(pbdata, '_shared_history_interval_seconds', 90))
+        except Exception:
+            _def_history = 90
+        try:
+            _def_exec = int(getattr(pbdata, '_shared_executions_interval_seconds', 1800))
+        except Exception:
+            _def_exec = 1800
+        try:
+            _def_rest_pause = float(getattr(pbdata, '_shared_rest_user_pause', 0.75))
+        except Exception:
+            _def_rest_pause = 0.75
+
+        cur_ws_val = _read_int_ini('pbdata', 'ws_max')
+        default_ws = cur_ws_val if cur_ws_val is not None else MAX_PRIVATE_WS_GLOBAL
+        cur_pollers_delay = _read_int_ini('pbdata', 'pollers_delay_seconds')
+        cur_combined = _read_int_ini('pbdata', 'poll_interval_combined_seconds')
+        cur_history = _read_int_ini('pbdata', 'poll_interval_history_seconds')
+        cur_exec = _read_int_ini('pbdata', 'poll_interval_executions_seconds')
+        cur_rest_pause = _read_float_ini('pbdata', 'shared_rest_user_pause_seconds')
+
+        r1 = st.columns(4)
+        with r1[0]:
+            ws_max = st.number_input('Max private WS global', min_value=0, value=default_ws, step=1,
+                                     key='pbdata_ws_max_input', help=pbgui_help.pbdata_ws_max)
+        with r1[1]:
+            pollers_delay_val = st.number_input('Startup delay (s)', min_value=0,
+                                                value=cur_pollers_delay if cur_pollers_delay is not None else _def_pollers_delay,
+                                                step=5, key='pbdata_pollers_delay_seconds_input',
+                                                help='Grace period before starting shared REST pollers to avoid startup bursts.')
+        with r1[2]:
+            combined_val = st.number_input('Combined interval (s)', min_value=10,
+                                           value=cur_combined if cur_combined is not None else _def_combined,
+                                           step=10, key='pbdata_poll_interval_combined_input',
+                                           help='Interval for shared combined REST poller (balances/positions/orders).')
+        with r1[3]:
+            history_val = st.number_input('History interval (s)', min_value=10,
+                                          value=cur_history if cur_history is not None else _def_history,
+                                          step=10, key='pbdata_poll_interval_history_input',
+                                          help='Interval for shared history REST poller.')
+
+        r2 = st.columns(2)
+        with r2[0]:
+            exec_val = st.number_input('Executions interval (s)', min_value=60,
+                                       value=cur_exec if cur_exec is not None else _def_exec,
+                                       step=60, key='pbdata_poll_interval_executions_input',
+                                       help='Interval for shared executions (my trades) REST poller.')
+        with r2[1]:
+            rest_pause_val = st.number_input('REST pause/user (s)', min_value=0.0,
+                                             value=cur_rest_pause if cur_rest_pause is not None else _def_rest_pause,
+                                             step=0.05, key='pbdata_shared_rest_user_pause_input',
+                                             help='Small pause between users in shared REST pollers to reduce rate limits.')
+
+        # Per-exchange overrides
+        try:
+            raw_json = load_ini('pbdata', 'shared_rest_pause_by_exchange_json')
+            sval = str(raw_json).strip() if raw_json is not None else ''
+            ini_overrides = json.loads(sval) if sval != '' else {}
+            if not isinstance(ini_overrides, dict):
+                ini_overrides = {}
+        except Exception:
+            ini_overrides = {}
+
+        with st.expander('Shared REST pause per exchange', expanded=False):
+            st.caption('Per-exchange pause between users. Defaults come from PBData (e.g. hyperliquid/bybit) unless you set an override; only differences vs the global pause are saved as overrides.')
+            exchange_ids = []
+            try:
+                exchange_ids = Exchanges.list()
+            except Exception:
+                exchange_ids = []
+            try:
+                exchange_ids = sorted([str(x) for x in exchange_ids if str(x).strip() != ''])
+            except Exception:
+                exchange_ids = [str(x) for x in exchange_ids]
+
+            cols_per_row = 4
+            for i in range(0, len(exchange_ids), cols_per_row):
+                row = exchange_ids[i:i + cols_per_row]
+                cols = st.columns(cols_per_row)
+                for col, exid_str in zip(cols, row):
+                    value_key = f'pbdata_rest_pause_ex_{exid_str}'
+                    try:
+                        if exid_str in ini_overrides:
+                            default_val = float(ini_overrides.get(exid_str))
+                        else:
+                            try:
+                                per_ex_defaults = getattr(pbdata, '_shared_rest_pause_by_exchange', {}) or {}
+                                if isinstance(per_ex_defaults, dict) and exid_str in per_ex_defaults:
+                                    default_val = float(per_ex_defaults.get(exid_str))
+                                else:
+                                    default_val = float(rest_pause_val)
+                            except Exception:
+                                default_val = float(rest_pause_val)
+                    except Exception:
+                        default_val = float(rest_pause_val)
+
+                    try:
+                        if exid_str not in ini_overrides and value_key in st.session_state:
+                            cur_v = float(st.session_state.get(value_key))
+                            if abs(cur_v - float(rest_pause_val)) < 1e-9 and abs(float(default_val) - float(rest_pause_val)) > 1e-9:
+                                st.session_state[value_key] = float(default_val)
+                    except Exception:
+                        pass
+                    with col:
+                        st.number_input(f'{exid_str} (s)', min_value=0.0, value=float(default_val), step=0.05,
+                                        key=value_key,
+                                        help='Per-exchange pause (seconds) between users for shared REST pollers.')
+
+        # ── Single Save button ───────────────────────────────────────────────
+        _pbdata_dirty = (
+            sorted(st.session_state.get("pbdata_users", pbdata.fetch_users or [])) != sorted(pbdata.fetch_users or []) or
+            sorted(st.session_state.get("pbdata_trades_users", pbdata.trades_users or [])) != sorted(pbdata.trades_users or []) or
+            st.session_state.get("pbdata_log_level_select", cur_ll_val or "INFO") != (cur_ll_val or "INFO") or
+            st.session_state.get("pbdata_ws_max_input", default_ws) != default_ws or
+            st.session_state.get("pbdata_pollers_delay_seconds_input", cur_pollers_delay if cur_pollers_delay is not None else _def_pollers_delay) != (cur_pollers_delay if cur_pollers_delay is not None else _def_pollers_delay) or
+            st.session_state.get("pbdata_poll_interval_combined_input", cur_combined if cur_combined is not None else _def_combined) != (cur_combined if cur_combined is not None else _def_combined) or
+            st.session_state.get("pbdata_poll_interval_history_input", cur_history if cur_history is not None else _def_history) != (cur_history if cur_history is not None else _def_history) or
+            st.session_state.get("pbdata_poll_interval_executions_input", cur_exec if cur_exec is not None else _def_exec) != (cur_exec if cur_exec is not None else _def_exec) or
+            abs(st.session_state.get("pbdata_shared_rest_user_pause_input", cur_rest_pause if cur_rest_pause is not None else _def_rest_pause) - (cur_rest_pause if cur_rest_pause is not None else _def_rest_pause)) > 1e-9
+        )
+        with st.sidebar:
+            _pbdata_save_clicked = st.button(":material/save:", key='pbdata_save_config_btn', type="primary" if _pbdata_dirty else "secondary")
+        if _pbdata_save_clicked:
+            _save_errors = []
+            # Users
+            try:
+                pbdata.fetch_users = st.session_state.get("pbdata_users", [])
+            except Exception as e:
+                _save_errors.append(f'fetch_users: {e}')
+            # Trades users
+            try:
+                pbdata.trades_users = st.session_state.get("pbdata_trades_users", [])
+            except Exception as e:
+                _save_errors.append(f'trades_users: {e}')
+            # Log level
+            try:
+                v = st.session_state.get('pbdata_log_level_select', 'INFO')
+                save_ini('pbdata', 'log_level', '' if v == 'NONE' else v)
+            except Exception as e:
+                _save_errors.append(f'log_level: {e}')
+            # Timers
+            try:
+                save_ini('pbdata', 'ws_max', str(int(ws_max)))
+                save_ini('pbdata', 'pollers_delay_seconds', str(int(pollers_delay_val)))
+                save_ini('pbdata', 'poll_interval_combined_seconds', str(int(combined_val)))
+                save_ini('pbdata', 'poll_interval_history_seconds', str(int(history_val)))
+                save_ini('pbdata', 'poll_interval_executions_seconds', str(int(exec_val)))
+                save_ini('pbdata', 'shared_rest_user_pause_seconds', str(float(rest_pause_val)))
+            except Exception as e:
+                _save_errors.append(f'timers: {e}')
+            # Per-exchange overrides
+            try:
+                cleaned = {}
+                for exid in Exchanges.list():
+                    exid_str = str(exid)
+                    value_key = f'pbdata_rest_pause_ex_{exid_str}'
+                    try:
+                        v = float(st.session_state.get(value_key, rest_pause_val))
+                    except Exception:
+                        v = float(rest_pause_val)
+                    if abs(v - float(rest_pause_val)) > 1e-9:
+                        cleaned[exid_str] = v
+                save_ini('pbdata', 'shared_rest_pause_by_exchange_json', json.dumps(cleaned) if cleaned else '')
+            except Exception as e:
+                _save_errors.append(f'exchange overrides: {e}')
+
+            if _save_errors:
+                st.error('Errors saving config: ' + '; '.join(_save_errors))
+            else:
+                st.rerun()
+
+        return
+
+    with st.sidebar:
+        if st.button(":material/settings: Settings", key="pbdata_settings_btn"):
+            st.session_state.pbdata_view_mode = "settings"
+            st.rerun()
+
+    # Log / Status tabs
+    tab_log, tab_status = st.tabs(["📋 Log", "📊 Status"])
+
+    with tab_log:
+        render_log_viewer(preselect="PBData.log", iframe_height_offset=320)
+
+    with tab_status:
+        _render_pbdata_status_tab()
+
+
 def pbcoindata_details():
     pbcoindata = st.session_state.pbcoindata
-    # Navigation
+
+    if "pbcoindata_view_mode" not in st.session_state:
+        st.session_state.pbcoindata_view_mode = "viewer"
+
+    if st.session_state.pbcoindata_view_mode == "settings":
+        with st.sidebar:
+            if st.button(":material/arrow_back: Back", key="pbcoindata_back_btn"):
+                st.session_state.pbcoindata_view_mode = "viewer"
+                st.rerun()
+
+        # Initialize session state once so widgets don't reset on every rerun
+        if "edit_coindata_api_key" not in st.session_state:
+            st.session_state["edit_coindata_api_key"] = pbcoindata.api_key
+        if "edit_coindata_fetch_limit" not in st.session_state:
+            st.session_state["edit_coindata_fetch_limit"] = pbcoindata.fetch_limit
+        if "edit_coindata_fetch_interval" not in st.session_state:
+            st.session_state["edit_coindata_fetch_interval"] = pbcoindata.fetch_interval
+        if "edit_coindata_metadata_interval" not in st.session_state:
+            st.session_state["edit_coindata_metadata_interval"] = pbcoindata.metadata_interval
+        if "edit_coindata_mapping_interval" not in st.session_state:
+            st.session_state["edit_coindata_mapping_interval"] = pbcoindata.mapping_interval
+
+        _cfg = st.columns([2, 1, 1, 1, 1])
+        with _cfg[0]:
+            st.text_input("CMC API Key", type="password", key="edit_coindata_api_key", help=pbgui_help.coindata_api_key)
+        with _cfg[1]:
+            st.number_input("Fetch Limit", min_value=200, max_value=5000, step=200, format="%.d", key="edit_coindata_fetch_limit", help=pbgui_help.coindata_fetch_limit)
+        with _cfg[2]:
+            st.number_input("Fetch Interval (h)", min_value=1, max_value=24, step=1, format="%.d", key="edit_coindata_fetch_interval", help=pbgui_help.coindata_fetch_interval)
+        with _cfg[3]:
+            st.number_input("Metadata Interval (d)", min_value=1, max_value=7, step=1, format="%.d", key="edit_coindata_metadata_interval", help=pbgui_help.coindata_metadata_interval)
+        with _cfg[4]:
+            st.number_input("Mapping Interval (h)", min_value=1, max_value=168, step=1, format="%.d", key="edit_coindata_mapping_interval", help=pbgui_help.coindata_mapping_interval)
+
+        _pbcoindata_dirty = (
+            st.session_state.get("edit_coindata_api_key", pbcoindata.api_key) != (pbcoindata.api_key or "") or
+            st.session_state.get("edit_coindata_fetch_limit", pbcoindata.fetch_limit) != pbcoindata.fetch_limit or
+            st.session_state.get("edit_coindata_fetch_interval", pbcoindata.fetch_interval) != pbcoindata.fetch_interval or
+            st.session_state.get("edit_coindata_metadata_interval", pbcoindata.metadata_interval) != pbcoindata.metadata_interval or
+            st.session_state.get("edit_coindata_mapping_interval", pbcoindata.mapping_interval) != pbcoindata.mapping_interval
+        )
+        with st.sidebar:
+            if st.button(":material/save:", key="button_pbcoindata_save", type="primary" if _pbcoindata_dirty else "secondary"):
+                pbcoindata.api_key = st.session_state.get("edit_coindata_api_key", pbcoindata.api_key)
+                pbcoindata.fetch_limit = st.session_state.get("edit_coindata_fetch_limit", pbcoindata.fetch_limit)
+                pbcoindata.fetch_interval = st.session_state.get("edit_coindata_fetch_interval", pbcoindata.fetch_interval)
+                pbcoindata.metadata_interval = st.session_state.get("edit_coindata_metadata_interval", pbcoindata.metadata_interval)
+                pbcoindata.mapping_interval = st.session_state.get("edit_coindata_mapping_interval", pbcoindata.mapping_interval)
+                pbcoindata.save_config()
+                st.rerun()
+        return
+
     with st.sidebar:
-        if st.button(":back:", key="button_pbcoindata_back"):
-            del st.session_state.pbcoindata_details
+        if st.button(":material/settings: Settings", key="pbcoindata_settings_btn"):
+            st.session_state.pbcoindata_view_mode = "settings"
             st.rerun()
-    st.subheader("PBCoinData Details")
-    pbcoindata_overview()
-    if st.checkbox("Show logfile", key="pbcoindata_log"):
-        st.session_state.pbgui_instances.view_log("PBCoinData")
+
+    # API status — auto-checked on page load, cached for 5 minutes to avoid burning CMC credits on every rerun
+    _API_CACHE_TTL = 300
+    _api_cache = st.session_state.get("_coindata_api_status_cache")
+    _api_cache_age = int(time.time() - _api_cache["ts"]) if _api_cache else None
+    _api_stale = _api_cache is None or _api_cache_age >= _API_CACHE_TTL
+    if pbcoindata.api_key:
+        if _api_stale:
+            _ok = pbcoindata.fetch_api_status()
+            st.session_state["_coindata_api_status_cache"] = {
+                "ok": _ok,
+                "ts": time.time(),
+                "error": pbcoindata.api_error if not _ok else None,
+            }
+            _api_cache = st.session_state["_coindata_api_status_cache"]
+            _api_cache_age = 0
+
+        _status_col, _refresh_col = st.columns([0.97, 0.03])
+        with _refresh_col:
+            _force_refresh = st.button(":material/refresh:", key="coindata_api_check_btn", help="Refresh API status now")
+            if _force_refresh:
+                _ok = pbcoindata.fetch_api_status()
+                st.session_state["_coindata_api_status_cache"] = {
+                    "ok": _ok,
+                    "ts": time.time(),
+                    "error": pbcoindata.api_error if not _ok else None,
+                }
+                st.rerun()
+        with _status_col:
+            if _api_cache and _api_cache["ok"]:
+                _age_str = f" *(checked {_api_cache_age}s ago)*" if _api_cache_age is not None else ""
+                st.success(
+                    f"**API Key valid** — "
+                    f"Limit: {pbcoindata.credit_limit_monthly} &nbsp;•&nbsp; "
+                    f"Today: {pbcoindata.credits_used_day} &nbsp;•&nbsp; "
+                    f"Monthly: {pbcoindata.credits_used_month} &nbsp;•&nbsp; "
+                    f"Left: **{pbcoindata.credits_left}** &nbsp;•&nbsp; "
+                    f"Resets: {pbcoindata.credit_limit_monthly_reset.replace('In ', '')}"
+                    f"{_age_str}",
+                    icon="✅",
+                )
+            elif _api_cache:
+                st.error(_api_cache["error"] or "Unknown API error", icon="🚨")
+    render_log_viewer(preselect="PBCoinData.log", iframe_height_offset=340)
+
+def _vps_settings_body():
+    """VPS monitoring settings body (embedded in PBAPIServer tab).
+
+    VPS monitoring runs automatically inside the PBAPIServer process.
+    This section configures which hosts to monitor and auto-restart behavior.
+    """
+    from pbgui_purefunc import load_ini, PBGDIR
+    import json, glob
+    from pathlib import Path
+
+    # ── Read current settings from pbgui.ini ──
+    def _load_auto_restart() -> bool:
+        val = load_ini("vps_monitor", "auto_restart")
+        return val.lower() == "true" if val else True
+
+    def _load_enabled_hosts() -> set[str]:
+        val = load_ini("vps_monitor", "enabled_hosts")
+        if val and val.strip():
+            return {h.strip() for h in val.split(",") if h.strip()}
+        return set()
+
+    def _available_hosts() -> list[str]:
+        vps_dir = Path(f'{PBGDIR}/data/vpsmanager/hosts')
+        hostnames = []
+        pattern = str(vps_dir / '*' / '*.json')
+        for filepath in sorted(glob.glob(pattern)):
+            try:
+                with open(filepath, 'r') as f:
+                    config = json.load(f)
+                hostname = config.get('_hostname')
+                if hostname:
+                    hostnames.append(hostname)
+            except Exception:
+                pass
+        return sorted(set(hostnames))
+
+    st.subheader("Auto-Restart")
+    auto_restart = _load_auto_restart()
+    if "vps_auto_restart" not in st.session_state:
+        st.session_state.vps_auto_restart = auto_restart
+
+    st.toggle(
+        "Auto-restart services",
+        key="vps_auto_restart",
+        help=pbgui_help.vps_auto_restart,
+    )
+
+    # ── VPS Host Selection ──
+    st.subheader("Monitored VPS Hosts")
+
+    available = _available_hosts()
+    current_enabled = _load_enabled_hosts()
+
+    if not available:
+        st.info("No VPS configured. Add VPS in **VPS Manager** first.")
+    else:
+        if "vps_enabled_hosts_select" not in st.session_state:
+            st.session_state.vps_enabled_hosts_select = sorted(
+                h for h in current_enabled if h in available
+            )
+        _c1, _c2, _c3 = st.columns([0.1, 0.1, 0.8])
+        with _c1:
+            if st.button("All", key="vps_select_all", use_container_width=True):
+                st.session_state.vps_enabled_hosts_select = available[:]
+                st.rerun()
+        with _c2:
+            if st.button("None", key="vps_clear_all", use_container_width=True):
+                st.session_state.vps_enabled_hosts_select = []
+                st.rerun()
+        st.multiselect(
+            "Monitored hosts",
+            options=available,
+            key="vps_enabled_hosts_select",
+            help=pbgui_help.vps_enabled_hosts,
+            label_visibility="collapsed",
+        )
+
+    return available, current_enabled, auto_restart
+
+def api_server_details():
+    api_server = st.session_state.api_server
+
+    if "api_server_view_mode" not in st.session_state:
+        st.session_state.api_server_view_mode = "viewer"
+
+    if st.session_state.api_server_view_mode == "settings":
+        with st.sidebar:
+            if st.button(":material/arrow_back: Back", key="api_server_back_btn"):
+                st.session_state.api_server_view_mode = "viewer"
+                st.rerun()
+
+        # ── Endpoints ──
+        h = api_server.host
+        p = api_server.port
+        st.info(
+            f"**Endpoints:**\n"
+            f"- API: `http://{h}:{p}`\n"
+            f"- Docs: `http://{h}:{p}/docs`\n"
+            f"- WebSocket: `ws://{h}:{p}/ws/jobs`\n"
+            f"- Frontend: `http://{h}:{p}/app/jobs_monitor.html`"
+        )
+
+        # ── Connection settings ──
+        if "api_server_host" not in st.session_state:
+            st.session_state.api_server_host = api_server.host
+        if "api_server_port" not in st.session_state:
+            st.session_state.api_server_port = api_server.port
+
+        _col_host, _col_port = st.columns([0.7, 0.3])
+        with _col_host:
+            st.text_input(
+                "Bind address",
+                key="api_server_host",
+                help="Network interface to bind to. Use 0.0.0.0 for remote access (all interfaces), "
+                     "or 127.0.0.1 to restrict to localhost only. Requires restart to take effect.",
+                placeholder="0.0.0.0"
+            )
+        with _col_port:
+            st.number_input(
+                "Port",
+                min_value=1024, max_value=65535, step=1,
+                key="api_server_port",
+                help="Port for FastAPI REST API and WebSocket (default: 8000). Requires restart to take effect.",
+            )
+
+        st.subheader("VPS Monitoring")
+        _vps_available, _vps_current_enabled, _vps_auto_restart = _vps_settings_body()
+
+        # ── Single save button for all settings ──
+        _new_enabled = set(
+            st.session_state.get("vps_enabled_hosts_select", [])
+        ) if _vps_available else set()
+
+        _dirty = (
+            st.session_state.get("api_server_host", api_server.host) != api_server.host or
+            st.session_state.get("api_server_port", api_server.port) != api_server.port or
+            st.session_state.get("vps_auto_restart", _vps_auto_restart) != _vps_auto_restart or
+            _new_enabled != _vps_current_enabled
+        )
+        with st.sidebar:
+            if st.button(":material/save:", key="api_server_save_config",
+                         type="primary" if _dirty else "secondary"):
+                api_server.host = st.session_state.api_server_host
+                api_server.port = st.session_state.api_server_port
+                from pbgui_purefunc import save_ini
+                save_ini("vps_monitor", "auto_restart",
+                         str(st.session_state.vps_auto_restart))
+                save_ini("vps_monitor", "enabled_hosts",
+                         ",".join(sorted(_new_enabled)))
+                st.rerun()
+        return
+
+    with st.sidebar:
+        if st.button(":material/settings: Settings", key="api_server_settings_btn"):
+            st.session_state.api_server_view_mode = "settings"
+            st.rerun()
+
+    render_log_viewer(preselect="PBApiServer.log", iframe_height_offset=280)
 
 # Redirect to Login if not authenticated or session state not initialized
 if not is_authenticted() or is_session_state_not_initialized():
@@ -1029,32 +1347,64 @@ if not is_authenticted() or is_session_state_not_initialized():
 # Page Setup
 set_page_config("PBGUI Services")
 
-# Header: show PBData Guide in the top header row (above a full-width divider)
-if 'pbdata_details' in st.session_state:
-    render_header_with_guide(
-        "PBGUI Services",
-        guide_callback=lambda: _help_modal('PBData'),
-        guide_key='pbdata_guide_btn',
-        guide_help='Open PBData help & tutorials',
-    )
-else:
-    render_header_with_guide("PBGUI Services")
+# Read active tab from session state *before* rendering the widget so the
+# title can be shown above the tabs on every rerun.
+_TABS = ["Overview", "PBRun", "PBRemote", "PBMon", "PBStat", "PBData", "PBCoinData", "PBAPIServer"]
+_cur_tab = st.session_state.get("services_active_tab") or "Overview"
+if _cur_tab not in _TABS:
+    _cur_tab = "Overview"
 
-if 'monitor_edit' in st.session_state:
-    st.session_state.monitor.edit_monitor_config()
-elif 'pbrun_details' in st.session_state:
-    pbrun_details()
-elif 'edit_bucket' in st.session_state:
-    edit_bucket()
-elif 'pbremote_details' in st.session_state:
-    pbremote_details()
-elif 'pbmon_details' in st.session_state:
-    pbmon_details()
-elif 'pbstat_details' in st.session_state:
-    pbstat_details()
-elif 'pbdata_details' in st.session_state:
-    pbdata_details()
-elif 'pbcoindata_details' in st.session_state:
-    pbcoindata_details()
-else:
+_guide_topic = "Services" if _cur_tab == "Overview" else _cur_tab
+render_header_with_guide(
+    "PBGUI Services" if _cur_tab == "Overview" else _cur_tab,
+    guide_callback=lambda t=_guide_topic: _help_modal(t),
+    guide_key=f"guide_btn_{_cur_tab}",
+    level="subheader",
+)
+
+active_tab = st.segmented_control("Tabs", _TABS, key="services_active_tab", default="Overview", label_visibility="collapsed")
+if active_tab is None:
+    active_tab = "Overview"
+
+if active_tab == "Overview":
     overview()
+
+elif active_tab == "PBRun":
+    with st.sidebar:
+        pbrun_overview(key_suffix="_det")
+    pbrun_details()
+
+elif active_tab == "PBRemote":
+    if st.session_state.get("pbremote_view_mode", "viewer") == "viewer":
+        with st.sidebar:
+            _pbremote_sidebar()
+    pbremote_details()
+
+elif active_tab == "PBMon":
+    if st.session_state.get("pbmon_view_mode", "viewer") == "viewer":
+        with st.sidebar:
+            pbmon_overview(key_suffix="_det")
+    pbmon_details()
+
+elif active_tab == "PBStat":
+    with st.sidebar:
+        pbstat_overview(key_suffix="_det")
+    pbstat_details()
+
+elif active_tab == "PBData":
+    if st.session_state.get("pbdata_view_mode", "viewer") == "viewer":
+        with st.sidebar:
+            pbdata_overview(key_suffix="_det")
+    pbdata_details()
+
+elif active_tab == "PBCoinData":
+    if st.session_state.get("pbcoindata_view_mode", "viewer") == "viewer":
+        with st.sidebar:
+            pbcoindata_overview(key_suffix="_det")
+    pbcoindata_details()
+
+elif active_tab == "PBAPIServer":
+    if st.session_state.get("api_server_view_mode", "viewer") == "viewer":
+        with st.sidebar:
+            api_server_overview(key_suffix="_det")
+    api_server_details()

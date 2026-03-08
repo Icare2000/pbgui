@@ -67,7 +67,7 @@ class ParetoExplorer:
         self.loader = None
         self.viz = None
         
-    def run(self):
+    def run(self, stage: str = "Command Center"):
         """Main entry point - runs the Streamlit app"""
 
         show_timings = bool(st.session_state.get('pareto_show_timings', False))
@@ -215,14 +215,12 @@ class ParetoExplorer:
             self.viz = ParetoVisualizations(self.loader)
         
         # Main content area
-        stage = st.session_state.get('stage', 'Command Center')
-
         with timer.section(f"stage:{stage}"):
-            if stage == 'Command Center':
+            if stage == "Command Center":
                 self._show_command_center()
-            elif stage == 'Pareto Playground':
+            elif stage == "Pareto Playground":
                 self._show_pareto_playground()
-            elif stage == 'Deep Intelligence':
+            elif stage == "Deep Intelligence":
                 self._show_deep_intelligence()
 
         if show_timings:
@@ -397,7 +395,7 @@ class ParetoExplorer:
                 st.button(
                     "🔄 Load all_results.bin",
                     help="Load all optimization results to compare with non-Pareto configs. This may take 10-30 seconds.",
-                    use_container_width=True,
+                    width='stretch',
                     on_click=_set_all_results_loaded,
                     args=(True,),
                 )
@@ -414,7 +412,7 @@ class ParetoExplorer:
                 st.button(
                     "⚡ Switch to Fast Mode",
                     help="Show only Pareto configs for faster performance",
-                    use_container_width=True,
+                    width='stretch',
                     on_click=_set_all_results_loaded,
                     args=(False,),
                 )
@@ -489,40 +487,6 @@ class ParetoExplorer:
                 st.info(f"📍 Showing **{num_showing:,}** configs (Rank {view_range[0]+1}-{view_range[1]})")
                 
                 st.markdown("---")
-            
-            # Navigation
-            st.subheader("🗺️ Navigate")
-            
-            stages = [
-                "🎯 Command Center",
-                "🎨 Pareto Playground", 
-                "🧠 Deep Intelligence",
-            ]
-            
-            # Remove emoji for session state key
-            stage_keys = [s.split(' ', 1)[1] for s in stages]
-            
-            # Get current stage from session state
-            current_stage = st.session_state.get('stage', 'Command Center')
-            
-            # Find index of current stage
-            try:
-                current_index = stage_keys.index(current_stage)
-            except ValueError:
-                current_index = 0  # Default to Command Center
-            
-            selected = st.radio(
-                "Choose Stage:",
-                stages,
-                index=current_index,
-                key='stage_selector',
-                label_visibility='collapsed'
-            )
-            
-            # Store selected stage
-            st.session_state['stage'] = selected.split(' ', 1)[1]
-            
-            st.markdown("---")
             
             # Quick actions
             st.subheader("⚡ Quick Actions")
@@ -1668,7 +1632,7 @@ class ParetoExplorer:
                     st.info("Some near-edge expansions were limited (e.g. lower bound clamped to 0). See 'expand_note'.")
                 if _rows:
                     st.caption(f"{len(_rows)} bound(s) listed (added/removed/changed/limited).")
-                    st.dataframe(_rows, use_container_width=True, hide_index=True)
+                    st.dataframe(_rows, width='stretch', hide_index=True)
                 else:
                     st.caption("No bounds changes detected.")
 
@@ -1676,7 +1640,7 @@ class ParetoExplorer:
                     st.write("**Parameters near bounds**")
                     if near_rows:
                         st.caption(f"{len(near_rows)} parameter(s) are near bounds (tolerance {near_bounds_tol:.0%}).")
-                        st.dataframe(near_rows, use_container_width=True, hide_index=True)
+                        st.dataframe(near_rows, width='stretch', hide_index=True)
                     else:
                         st.caption("No parameters near bounds detected (or data unavailable).")
             except Exception:
@@ -1686,7 +1650,7 @@ class ParetoExplorer:
             if st.button(
                 "💾 Create Optimize Preset",
                 type="primary",
-                use_container_width=True,
+                width='stretch',
                 key=f"{key_prefix}_create_preset",
             ):
                 try:
@@ -1755,7 +1719,6 @@ class ParetoExplorer:
     def _show_command_center(self):
         """Stage 1: Command Center - Overview and Top Performers"""
         
-        st.title("🎯 COMMAND CENTER")
         st.markdown("**High-level overview of your optimization run**")
         
         # Load Strategy Configuration Section
@@ -2587,7 +2550,7 @@ class ParetoExplorer:
         st.markdown("---")
         col_bt1, col_bt2, col_bt3 = st.columns([1, 2, 1])
         with col_bt2:
-            if st.button("🚀 Run Backtest with this Config", use_container_width=True, type="primary"):
+            if st.button("🚀 Run Backtest with this Config", width='stretch', type="primary"):
                 try:
                     import BacktestV7
                     from pbgui_func import get_navi_paths, pb7dir
@@ -2643,13 +2606,8 @@ class ParetoExplorer:
     def _show_pareto_playground(self):
         """Stage 2: Pareto Playground - Interactive Exploration"""
         
-        st.title("🎨 PARETO PLAYGROUND")
-        st.markdown("**Interactive multi-dimensional exploration**")
-        
-        st.markdown("---")
-        
         # Preference sliders
-        st.subheader("🎚️ YOUR PREFERENCES")
+        st.subheader("🎚 Your Preferences")
         
         col1, col2, col3 = st.columns(3)
         
@@ -3461,7 +3419,7 @@ class ParetoExplorer:
                         title_prefix=""
                     )
                     fig_xy.update_layout(height=400, showlegend=False)
-                    event_xy = st.plotly_chart(fig_xy, key='chart_xy', on_select="rerun", use_container_width=True)
+                    event_xy = st.plotly_chart(fig_xy, key='chart_xy', on_select="rerun", width='stretch')
                 
                 with col_xz:
                     st.markdown(f"**XZ Plane**<br><small>{x_metric} vs {z_metric}</small>", unsafe_allow_html=True)
@@ -3474,7 +3432,7 @@ class ParetoExplorer:
                         title_prefix=""
                     )
                     fig_xz.update_layout(height=400, showlegend=False)
-                    event_xz = st.plotly_chart(fig_xz, key='chart_xz', on_select="rerun", use_container_width=True)
+                    event_xz = st.plotly_chart(fig_xz, key='chart_xz', on_select="rerun", width='stretch')
                 
                 with col_yz:
                     st.markdown(f"**YZ Plane**<br><small>{y_metric} vs {z_metric}</small>", unsafe_allow_html=True)
@@ -3487,7 +3445,7 @@ class ParetoExplorer:
                         title_prefix=""
                     )
                     fig_yz.update_layout(height=400, showlegend=False)
-                    event_yz = st.plotly_chart(fig_yz, key='chart_yz', on_select="rerun", use_container_width=True)
+                    event_yz = st.plotly_chart(fig_yz, key='chart_yz', on_select="rerun", width='stretch')
                 
                 # Handle click events from any of the three charts
                 for event in [event_xy, event_xz, event_yz]:
@@ -3584,10 +3542,6 @@ class ParetoExplorer:
     
     def _show_deep_intelligence(self):
         """Stage 3: Deep Intelligence - Parameter & Market Analysis"""
-        
-        st.title("🧠 DEEP INTELLIGENCE")
-        st.markdown("**Advanced parameter and scenario analysis**")
-
 
         # Persist active tab across reruns/mode switches.
         # Streamlit tabs do not expose a readable active tab state, so we use a stateful
@@ -4232,7 +4186,7 @@ class ParetoExplorer:
                         fig = self.viz.plot_risk_profile_radar(selected_configs, labels)
                         
                         # Make radar chart clickable to select configs
-                        radar_selection = st.plotly_chart(fig, use_container_width=True, on_select="rerun", key='risk_profile_radar')
+                        radar_selection = st.plotly_chart(fig, width='stretch', on_select="rerun", key='risk_profile_radar')
                         
                         # Handle clicks on radar chart (both points and legend)
                         if radar_selection and hasattr(radar_selection, 'selection'):

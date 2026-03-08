@@ -1,14 +1,14 @@
 import streamlit as st
+import streamlit.components.v1 as _st_components
 import json
 import hjson
 import pprint
 import uuid
 import requests
-import configparser
 import os
 from time import sleep
 from pathlib import Path
-from pbgui_purefunc import load_ini, save_ini
+from pbgui_purefunc import load_ini, save_ini, load_symbols_from_ini as _load_symbols_from_mapping
 # LogHandler removed: centralized debuglog removed per user request
 from PBRemote import PBRemote
 from MonitorConfig import MonitorConfig
@@ -46,7 +46,7 @@ def render_header_with_guide(
                 st.header(t)
         return
 
-    c_title, c_help = st.columns([0.95, 0.05], vertical_alignment="center")
+    c_title, c_help = st.columns([0.94, 0.06], vertical_alignment="center")
     with c_title:
         if level == "subheader":
             st.subheader(t)
@@ -165,6 +165,11 @@ def check_password():
         return True
 
 def set_page_config(page : str = "Start"):
+    # One-time INI migration (pbmaster → vps_monitor)
+    if "_ini_migrated" not in st.session_state:
+        from pbgui_purefunc import migrate_ini_sections
+        migrate_ini_sections()
+        st.session_state._ini_migrated = True
     st.session_state.page = page
     st.set_page_config(
         page_title=f"PBGUI - {page}",
@@ -173,11 +178,25 @@ def set_page_config(page : str = "Start"):
         initial_sidebar_state="expanded",
         menu_items={
             'Get help': 'https://github.com/msei99/pbgui/#readme',
-            'About': "Passivbot GUI v1.53 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/Y8Y216Q3QS)"
+            'About': "Passivbot GUI v1.66 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/Y8Y216Q3QS)"
         }
     )
+    # Global layout CSS — applied on every page
+    st.markdown("""
+<style>
+    .stMainBlockContainer {
+        padding-top: 2.25rem !important;
+        padding-bottom: 1rem !important;
+    }
+    .stMainBlockContainer h1,
+    .stMainBlockContainer h2,
+    .stMainBlockContainer h3 {
+        margin-top: 0.25rem !important;
+    }
+</style>""", unsafe_allow_html=True)
     # Check VPS Errors
-    has_vps_errors()
+    if str(page) != "VPS Monitor":
+        has_vps_errors()
     
     with st.sidebar:
         st.write(f"### {page} Options")
@@ -190,10 +209,13 @@ def get_navi_paths():
         "SYSTEM_API_KEYS":     os.path.join(NAVI_BASE_DIR, "system_api_keys.py"),
         "SYSTEM_SERVICES":     os.path.join(NAVI_BASE_DIR, "system_services.py"),
         "SYSTEM_VPS_MANAGER":  os.path.join(NAVI_BASE_DIR, "system_vps_manager.py"),
+        "SYSTEM_VPS_MONITOR":  os.path.join(NAVI_BASE_DIR, "system_vps_monitor.py"),
+        "SYSTEM_LOGGING":      os.path.join(NAVI_BASE_DIR, "system_logging.py"),
         "SYSTEM_DEBUGLOG":     os.path.join(NAVI_BASE_DIR, "system_debuglog.py"),
 
         "INFO_DASHBOARDS":     os.path.join(NAVI_BASE_DIR, "info_dashboards.py"),
         "INFO_COIN_DATA":      os.path.join(NAVI_BASE_DIR, "info_coin_data.py"),
+        "INFO_MARKET_DATA":    os.path.join(NAVI_BASE_DIR, "info_market_data.py"),
 
         "V6_SINGLE_RUN":       os.path.join(NAVI_BASE_DIR, "v6_single_run.py"),
         "V6_SINGLE_BACKTEST":  os.path.join(NAVI_BASE_DIR, "v6_single_backtest.py"),
@@ -222,10 +244,13 @@ def build_navigation():
     pM2 = st.Page(paths["SYSTEM_API_KEYS"], title="API-Keys", icon=":material/key:")
     pM3 = st.Page(paths["SYSTEM_SERVICES"], title="PBGUI Services", icon=":material/build:")
     pM4 = st.Page(paths["SYSTEM_VPS_MANAGER"], title="VPS Manager", icon=":material/computer:")
+    pM4b = st.Page(paths["SYSTEM_VPS_MONITOR"], title="VPS Monitor", icon=":material/monitor_heart:")
+    pM5 = st.Page(paths["SYSTEM_LOGGING"], title="Logging", icon=":material/article:")
     # Debuglog page removed
 
     pSe1 = st.Page(paths["INFO_DASHBOARDS"], title="Dashboards", icon=":material/dashboard:")
     pSe2 = st.Page(paths["INFO_COIN_DATA"], title="Coin Data", icon=":material/monetization_on:")
+    pSe3 = st.Page(paths["INFO_MARKET_DATA"], title="Market Data", icon=":material/storage:")
     pH1 = st.Page(paths["HELP"], title="Help", icon=":material/help:", url_path="help")
 
 
@@ -238,11 +263,11 @@ def build_navigation():
     p77 = st.Page(paths["V7_LIVE_VS_BACKTEST"], title="Live vs Backtest", icon=":material/swap_horiz:")
        
     # Page Groups
-    SystemPages = [pM1, pM2, pM3, pM4]
+    SystemPages = [pM1, pM2, pM3, pM4, pM4b, pM5]
     
     # Do not include DEBUGLOG page; centralized debuglog removed
                 
-    InfotmationPages = [pSe1, pSe2, pH1]
+    InfotmationPages = [pSe1, pSe2, pSe3, pH1]
     v7Pages = [p71, p72, p77, p73, p74, p75, p76]
     # Navigation
     navi = st.navigation(
@@ -305,12 +330,7 @@ def upload_pbconfigdb(config: str, symbol: str, source_name : str):
         st.error("Invalid config", icon="🚨")
 
 def load_symbols_from_ini(exchange: str, market_type: str):
-    pb_config = configparser.ConfigParser()
-    pb_config.read('pbgui.ini')
-    if pb_config.has_option("exchanges", f'{exchange}.{market_type}'):
-        return eval(pb_config.get("exchanges", f'{exchange}.{market_type}'))
-    else:
-        return []
+    return _load_symbols_from_mapping(exchange, market_type)
 
 def update_dir(key):
     choice = st.session_state[key]
@@ -392,3 +412,378 @@ def has_vps_errors():
                     st.warning(f'Server: {error["server"]} Instance: {error["name"]} Mem: {error["mem"]} Swap: {error["swap"]} CPU: {error["cpu"]} Disk: {error["disk"]}')
                 else:
                     st.warning(f'Server: {error["server"]} Instance: {error["name"]} Mem: {error["mem"]} Swap: {error["swap"]} CPU: {error["cpu"]} Error: {error["error"]} Traceback: {error["traceback"]}')
+
+
+# ── Log Viewer component ─────────────────────────────────────────────────────
+
+_LOG_VIEWER_DIR = Path(__file__).resolve().parent / "components" / "log_viewer"
+_LOG_VIEWER_HTML: str | None = None
+
+
+def _load_log_viewer_html() -> str:
+    global _LOG_VIEWER_HTML
+    if _LOG_VIEWER_HTML is None:
+        _LOG_VIEWER_HTML = (_LOG_VIEWER_DIR / "index.html").read_text(encoding="utf-8")
+    return _LOG_VIEWER_HTML
+
+
+def render_log_viewer(
+    preselect: str = "",
+    iframe_height_offset: int = 200,
+    display_title: str = "",
+) -> None:
+    """Render the WebSocket log viewer component.
+
+    Centralises all boilerplate: HTML loading, placeholder injection, CSS
+    override, and component rendering.
+
+    Args:
+        preselect: filename (e.g. ``"MarketData.log"``) to auto-open on load.
+        iframe_height_offset: pixels subtracted from ``100vh`` for the iframe
+            height.  Increase when there are tabs or extra widgets above the
+            viewer (default 200 for a plain page, ~260 when inside tabs).
+        display_title: optional human-readable label shown in the viewer
+            toolbar alongside the filename (e.g. the backtest name).
+    """
+    # API server connection for WebSocket log streaming
+    api_host_cfg, api_port_val, _api_ok = _start_fastapi_server_if_needed()
+
+    # Determine browser-usable hostname (bind address 0.0.0.0 is not valid for WS)
+    _ws_host = "127.0.0.1"
+    try:
+        import streamlit as _st
+        _req_host = _st.context.headers.get("Host", "")
+        if _req_host:
+            _ws_host = _req_host.split(":")[0] or "127.0.0.1"
+    except Exception:
+        pass
+
+    # Generate / reuse API token for this session
+    from api.auth import generate_token as _gen_token
+    if "api_token" not in __import__('streamlit').session_state:
+        _user_id = (
+            __import__('streamlit').session_state.get("user", {}).get("id")
+            or __import__('streamlit').session_state.get("user")
+            or "anonymous"
+        )
+        _tok = _gen_token(str(_user_id), expires_in_seconds=86400)
+        __import__('streamlit').session_state["api_token"] = _tok.token
+    _api_token = __import__('streamlit').session_state["api_token"]
+    logs_dir = Path(__file__).resolve().parent / "data" / "logs"
+    log_files: list[str] = []
+    if logs_dir.exists():
+        # Only top-level *.log — job logs (data/logs/jobs/) are intentionally excluded
+        # from the sidebar to avoid flooding it. They are loaded on-demand via preselect.
+        log_files = sorted(p.name for p in logs_dir.glob("*.log") if p.is_file())
+    file_sizes: dict = {}
+    rotated_files: dict = {}
+    if logs_dir.exists():
+        for base in log_files:
+            file_sizes[base] = (logs_dir / base).stat().st_size
+            variants: list[str] = []
+            for i in range(1, 20):
+                p = logs_dir / f"{base}.{i}"
+                if p.is_file():
+                    variants.append(p.name)
+                    file_sizes[p.name] = p.stat().st_size
+                else:
+                    break
+            p_old = logs_dir / f"{base}.old"
+            if p_old.is_file():
+                variants.append(p_old.name)
+                file_sizes[p_old.name] = p_old.stat().st_size
+            if variants:
+                rotated_files[base] = variants
+
+    html = (
+        _load_log_viewer_html()
+        .replace("__API_PORT__", str(api_port_val))
+        .replace("__API_TOKEN__", _api_token)
+        .replace("__API_HOST__", _ws_host)
+        .replace("__INITIAL_FILES__", json.dumps(log_files))
+        .replace("__FILE_SIZES__", json.dumps(file_sizes))
+        .replace("__ROTATED_FILES__", json.dumps(rotated_files))
+        .replace("__PRESELECT_FILE__", json.dumps(preselect))
+        .replace("__DISPLAY_TITLE__",    json.dumps(display_title))
+    )
+
+    st.markdown(f"""
+<style>
+    /* Target the iframe only */
+    .stMainBlockContainer iframe {{
+        height: calc(100vh - {iframe_height_offset}px) !important;
+        min-height: 400px !important;
+        border: none !important;
+    }}
+</style>""", unsafe_allow_html=True)
+
+    _st_components.html(html, height=600, scrolling=False)
+
+
+def _start_fastapi_server_if_needed() -> tuple[str, int, bool]:
+    """Start FastAPI server if not already running.
+
+    Delegates to PBApiServer (single source of truth for PID lifecycle).
+    Returns:
+        Tuple of (host, port, success)
+    """
+    from PBApiServer import PBApiServer
+
+    # Reuse the session-state instance when available (Streamlit context),
+    # otherwise create a transient one (in tests / non-UI callers).
+    if "api_server" in st.session_state:
+        srv = st.session_state.api_server
+    else:
+        srv = PBApiServer()
+
+    if not srv.is_running():
+        srv.run()
+
+    return (srv.host, srv.port, srv.is_running())
+
+
+def render_fastapi_job_monitor(height: int = 800, exchange: str = "", job_type: str = "") -> None:
+    """Render the FastAPI job monitor component via iframe.
+    
+    Automatically starts the FastAPI server if not already running.
+    Generates an API token for the current user session and embeds the
+    job monitor in an iframe with the token for authentication.
+    
+    Configuration is read from pbgui.ini ([api_server] section).
+    
+    Args:
+        height: iframe height in pixels (default: 800)
+        exchange: optional exchange filter (e.g. "binanceusdm", "bybit", "hyperliquid")
+        job_type: optional job type filter — comma-separated (e.g. "hl_best_1m" or "hl_aws_l2book_auto")
+    """
+    from api.auth import generate_token
+    
+    # Ensure FastAPI server is running and get config
+    api_host, api_port, success = _start_fastapi_server_if_needed()
+    
+    if not success:
+        st.error(f"⚠️ FastAPI server could not be started on {api_host}:{api_port}. "
+                 f"Please check **System → Services → API Server** or start manually: `python PBApiServer.py`")
+        return
+    
+    # Get or create token for current session
+    if "api_token" not in st.session_state:
+        # Use Streamlit's session_id if available, else generate one
+        user_id = st.session_state.get("user", {}).get("id") or st.session_state.get("user") or "anonymous"
+        token_obj = generate_token(str(user_id), expires_in_seconds=86400)
+        st.session_state["api_token"] = token_obj.token
+    
+    token = st.session_state["api_token"]
+
+    # Derive browser-usable hostname (0.0.0.0 is not routable from the browser)
+    _browser_host = "127.0.0.1"
+    try:
+        _req_host = st.context.headers.get("Host", "")
+        if _req_host:
+            _browser_host = _req_host.split(":")[0] or "127.0.0.1"
+    except Exception:
+        pass
+
+    # Build iframe URL with token and optional filters
+    exchange_param = f"&exchange={exchange}" if exchange else ""
+    job_type_param = f"&job_type={job_type}" if job_type else ""
+    iframe_url = f"http://{_browser_host}:{api_port}/app/jobs_monitor.html?token={token}{exchange_param}{job_type_param}"
+    _st_components.iframe(iframe_url, height=height, scrolling=True)
+
+
+def render_fastapi_hl_data_actions() -> None:
+    """Render combined HL data actions (Download l2Book + Build OHLCV).
+
+    Uses st.html(unsafe_allow_javascript=True) to inject the HTML directly
+    into the Streamlit DOM (NO iframe). This allows natural height flow —
+    collapsed sections take zero extra space, expanded sections grow naturally.
+    All CSS is scoped under .hlda-root to avoid Streamlit style conflicts.
+    Collapse/expand uses vanilla JS + localStorage persistence.
+    Job monitors are inline WebSocket-connected divs (no iframe).
+    """
+    from pathlib import Path
+    from api.auth import generate_token
+
+    api_host, api_port, success = _start_fastapi_server_if_needed()
+    if not success:
+        st.error(f"⚠️ FastAPI server could not be started on {api_host}:{api_port}.")
+        return
+
+    if "api_token" not in st.session_state:
+        user_id = st.session_state.get("user", {}).get("id") or st.session_state.get("user") or "anonymous"
+        token_obj = generate_token(str(user_id), expires_in_seconds=86400)
+        st.session_state["api_token"] = token_obj.token
+
+    token = st.session_state["api_token"]
+
+    _browser_host = "127.0.0.1"
+    try:
+        _req_host = st.context.headers.get("Host", "")
+        if _req_host:
+            _browser_host = _req_host.split(":")[0] or "127.0.0.1"
+    except Exception:
+        pass
+
+    api_host_str = f"{_browser_host}:{api_port}"
+    api_base_str = f"http://{_browser_host}:{api_port}/api"
+
+    # Read HTML template
+    html_path = Path(__file__).parent / "frontend" / "hl_data_actions.html"
+    html_content = html_path.read_text(encoding="utf-8")
+
+    # Unique IDs so multiple instances don't conflict
+    instance_id = "hlda_inst"
+    html_content = html_content.replace("__HLDA_ROOT__", instance_id)
+    html_content = html_content.replace("__HLDA__", f"{instance_id}_")
+
+    # Inject config via data-* attributes on root element
+    html_content = html_content.replace(
+        'data-token=""', f'data-token="{token}"'
+    ).replace(
+        'data-api-base=""', f'data-api-base="{api_base_str}"'
+    ).replace(
+        'data-api-host=""', f'data-api-host="{api_host_str}"'
+    )
+
+    st.html(html_content, unsafe_allow_javascript=True)
+
+
+def render_fastapi_market_data_status(exchange: str) -> None:
+    """
+    Render FastAPI-based Market Data Status monitor (vanilla HTML/JS).
+
+    Uses st.html(unsafe_allow_javascript=True) to inject the HTML directly
+    into the Streamlit DOM (NO iframe). This allows natural height flow —
+    collapsed state takes zero extra space, expanded state grows naturally.
+    All CSS is scoped under .mds-root to avoid Streamlit style conflicts.
+    Collapse/expand uses vanilla JS + localStorage persistence.
+
+    Args:
+        exchange: Exchange name ("binanceusdm", "bybit", "hyperliquid")
+    """
+    from pathlib import Path
+    from api.auth import generate_token
+
+    # Ensure FastAPI server is running and get config
+    api_host, api_port, success = _start_fastapi_server_if_needed()
+
+    if not success:
+        st.error(f"⚠️ FastAPI server could not be started on {api_host}:{api_port}. "
+                 f"Please check **System → Services → API Server** or start manually: `python PBApiServer.py`")
+        return
+
+    # Get or create token for current session
+    if "api_token" not in st.session_state:
+        user_id = st.session_state.get("user", {}).get("id") or st.session_state.get("user") or "anonymous"
+        token_obj = generate_token(str(user_id), expires_in_seconds=86400)
+        st.session_state["api_token"] = token_obj.token
+
+    token = st.session_state["api_token"]
+    exchange_param = exchange.lower().strip()
+
+    # Derive browser-usable hostname (0.0.0.0 is not routable from the browser)
+    _browser_host = "127.0.0.1"
+    try:
+        _req_host = st.context.headers.get("Host", "")
+        if _req_host:
+            _browser_host = _req_host.split(":")[0] or "127.0.0.1"
+    except Exception:
+        pass
+
+    api_host_str = f"{_browser_host}:{api_port}"
+    api_base_str = f"http://{_browser_host}:{api_port}/api"
+
+    # Read HTML template and make element IDs unique per exchange
+    html_path = Path(__file__).parent / "frontend" / "market_data_status.html"
+    html_content = html_path.read_text(encoding="utf-8")
+
+    # Unique IDs so multiple instances on the same page don't conflict
+    instance_id = f"mds_{exchange_param}"
+    html_content = html_content.replace("__MDS_ROOT_ID__", instance_id)
+    html_content = html_content.replace("__MDS_ID__", f"{instance_id}_")
+
+    # Inject config via data-* attributes on root element (no separate script needed)
+    html_content = html_content.replace(
+        'data-token=""', f'data-token="{token}"'
+    ).replace(
+        'data-exchange=""', f'data-exchange="{exchange_param}"'
+    ).replace(
+        'data-api-host=""', f'data-api-host="{api_host_str}"'
+    ).replace(
+        'data-api-base=""', f'data-api-base="{api_base_str}"'
+    )
+
+    # st.html with unsafe_allow_javascript: renders directly in DOM (no iframe!)
+    # Natural height flow — collapsed = just header, expanded = full content
+    st.html(html_content, unsafe_allow_javascript=True)
+
+
+def render_fastapi_gap_heatmap(exchange: str, dataset: str, coin: str) -> None:
+    """
+    Render the Gap / Coverage Heatmap via FastAPI + Vanilla JS (Plotly.js).
+
+    Uses st.html(unsafe_allow_javascript=True) to inject the HTML directly
+    into the Streamlit DOM (NO iframe, NO run_every fragment).
+    The JS frontend loads Plotly.js from the local API server, fetches chart
+    data from /api/heatmap/* endpoints, and keeps itself up-to-date via a
+    WebSocket (/ws/heatmap-watch) that fires when the underlying data changes.
+
+    Args:
+        exchange: Exchange name ("hyperliquid", "binanceusdm", "bybit", ...)
+        dataset:  Dataset name ("1m", "candles_1m", "l2Book", "pb7_cache:…", …)
+        coin:     Coin symbol (e.g. "BTC", "AAPL")
+    """
+    from pathlib import Path
+    from api.auth import generate_token
+
+    api_host, api_port, success = _start_fastapi_server_if_needed()
+    if not success:
+        st.error(f"⚠️ FastAPI server could not be started on {api_host}:{api_port}. "
+                 f"Please check **System → Services → API Server** or start manually: `python PBApiServer.py`")
+        return
+
+    if "api_token" not in st.session_state:
+        user_id = (st.session_state.get("user", {}).get("id")
+                   or st.session_state.get("user")
+                   or "anonymous")
+        token_obj = generate_token(str(user_id), expires_in_seconds=86400)
+        st.session_state["api_token"] = token_obj.token
+
+    token = st.session_state["api_token"]
+    exchange_param = str(exchange).lower().strip()
+    dataset_param  = str(dataset).strip()
+    coin_param     = str(coin).strip()
+
+    # Derive browser-usable hostname (0.0.0.0 is not routable from the browser)
+    _browser_host = "127.0.0.1"
+    try:
+        _req_host = st.context.headers.get("Host", "")
+        if _req_host:
+            _browser_host = _req_host.split(":")[0] or "127.0.0.1"
+    except Exception:
+        pass
+
+    api_base_str   = f"http://{_browser_host}:{api_port}/api"
+
+    html_path = Path(__file__).parent / "frontend" / "gap_heatmap.html"
+    html_content = html_path.read_text(encoding="utf-8")
+
+    # Make element IDs unique per exchange/dataset/coin so multiple instances
+    # on the same Streamlit page don't collide.
+    safe_ds   = dataset_param.replace(":", "_").replace("/", "_")
+    safe_coin = coin_param.replace("/", "_").replace(":", "_")
+    instance_id = f"hm_{exchange_param}_{safe_ds}_{safe_coin}"
+    html_content = html_content.replace("__HM_ROOT_ID__", instance_id)
+
+    html_content = (
+        html_content
+        .replace('data-token=""',    f'data-token="{token}"')
+        .replace('data-exchange=""', f'data-exchange="{exchange_param}"')
+        .replace('data-dataset=""',  f'data-dataset="{dataset_param}"')
+        .replace('data-coin=""',     f'data-coin="{coin_param}"')
+        .replace('data-api-host=""', f'data-api-host="{_browser_host}:{api_port}"')
+        .replace('data-api-base=""', f'data-api-base="{api_base_str}"')
+    )
+
+    st.html(html_content, unsafe_allow_javascript=True)
+

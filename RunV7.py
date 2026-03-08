@@ -2,6 +2,7 @@ import streamlit as st
 import streamlit_scrollable_textbox as stx
 import pbgui_help
 from pbgui_func import pbdir, PBGDIR, load_symbols_from_ini, validateHJSON, st_file_selector, info_popup, error_popup
+from PBCoinData import CoinData, normalize_symbol
 from PBRemote import PBRemote
 from User import Users
 from Config import Config, ConfigV7, Logging
@@ -233,6 +234,35 @@ class V7Instance():
         )
 
     @st.fragment
+    def fragment_enable_archive_candle_fetch(self):
+        if "edit_run_v7_enable_archive_candle_fetch" in st.session_state:
+            if st.session_state.edit_run_v7_enable_archive_candle_fetch != self.config.live.enable_archive_candle_fetch:
+                self.config.live.enable_archive_candle_fetch = st.session_state.edit_run_v7_enable_archive_candle_fetch
+        else:
+            st.session_state.edit_run_v7_enable_archive_candle_fetch = bool(self.config.live.enable_archive_candle_fetch)
+        st.checkbox(
+            "enable_archive_candle_fetch",
+            key="edit_run_v7_enable_archive_candle_fetch",
+            help=pbgui_help.enable_archive_candle_fetch,
+        )
+
+    @st.fragment
+    def fragment_max_ohlcv_fetches_per_minute(self):
+        if "edit_run_v7_max_ohlcv_fetches_per_minute" in st.session_state:
+            if int(st.session_state.edit_run_v7_max_ohlcv_fetches_per_minute) != self.config.live.max_ohlcv_fetches_per_minute:
+                self.config.live.max_ohlcv_fetches_per_minute = int(st.session_state.edit_run_v7_max_ohlcv_fetches_per_minute)
+        else:
+            st.session_state.edit_run_v7_max_ohlcv_fetches_per_minute = int(self.config.live.max_ohlcv_fetches_per_minute)
+        st.number_input(
+            "max_ohlcv_fetches_per_minute",
+            min_value=1,
+            step=1,
+            format="%d",
+            key="edit_run_v7_max_ohlcv_fetches_per_minute",
+            help=pbgui_help.max_ohlcv_fetches_per_minute,
+        )
+
+    @st.fragment
     def fragment_memory_snapshot_interval_minutes(self):
         if "edit_run_v7_memory_snapshot_interval_minutes" in st.session_state:
             if st.session_state.edit_run_v7_memory_snapshot_interval_minutes != self.config.logging.memory_snapshot_interval_minutes:
@@ -436,6 +466,11 @@ class V7Instance():
         st.number_input("balance_hysteresis_snap_pct", min_value=0.0, max_value=0.5, step=0.01, format="%.2f", key="edit_run_v7_balance_hysteresis_snap_pct", help=pbgui_help.balance_hysteresis_snap_pct)
 
     def fragment_filter_coins(self):
+        if "pbcoindata" not in st.session_state:
+            st.session_state.pbcoindata = CoinData()
+        coindata = st.session_state.pbcoindata
+        exchange_id = self._users.find_exchange(self.user)
+
         col1, col2, col3, col4, col5 = st.columns([1,1,1,0.5,0.5], vertical_alignment="bottom")
         with col1:
             self.fragment_market_cap()
@@ -448,47 +483,88 @@ class V7Instance():
             self.fragment_notices_ignore()
         with col5:
             st.checkbox("apply_filters", value=False, help=pbgui_help.apply_filters, key="edit_run_v7_apply_filters")
+        def _normalize_list(items):
+            normalized = []
+            for item in items:
+                base = normalize_symbol(item)
+                if base and base not in normalized:
+                    normalized.append(base)
+            return normalized
         # Init session state for approved_coins
         if "edit_run_v7_approved_coins_long" in st.session_state:
             if st.session_state.edit_run_v7_approved_coins_long != self.config.live.approved_coins.long:
                 self.config.live.approved_coins.long = st.session_state.edit_run_v7_approved_coins_long
         else:
+            self.config.live.approved_coins.long = _normalize_list(self.config.live.approved_coins.long)
             st.session_state.edit_run_v7_approved_coins_long = self.config.live.approved_coins.long
         if "edit_run_v7_approved_coins_short" in st.session_state:
             if st.session_state.edit_run_v7_approved_coins_short != self.config.live.approved_coins.short:
                 self.config.live.approved_coins.short = st.session_state.edit_run_v7_approved_coins_short
         else:
+            self.config.live.approved_coins.short = _normalize_list(self.config.live.approved_coins.short)
             st.session_state.edit_run_v7_approved_coins_short = self.config.live.approved_coins.short
         # Init session state for ignored_coins
         if "edit_run_v7_ignored_coins_long" in st.session_state:
             if st.session_state.edit_run_v7_ignored_coins_long != self.config.live.ignored_coins.long:
                 self.config.live.ignored_coins.long = st.session_state.edit_run_v7_ignored_coins_long
         else:
+            self.config.live.ignored_coins.long = _normalize_list(self.config.live.ignored_coins.long)
             st.session_state.edit_run_v7_ignored_coins_long = self.config.live.ignored_coins.long
         if "edit_run_v7_ignored_coins_short" in st.session_state:
             if st.session_state.edit_run_v7_ignored_coins_short != self.config.live.ignored_coins.short:
                 self.config.live.ignored_coins.short = st.session_state.edit_run_v7_ignored_coins_short
         else:
+            self.config.live.ignored_coins.short = _normalize_list(self.config.live.ignored_coins.short)
             st.session_state.edit_run_v7_ignored_coins_short = self.config.live.ignored_coins.short
         # Appliy filters
         if st.session_state.edit_run_v7_apply_filters:
-            self.config.live.approved_coins.long = st.session_state.pbcoindata.approved_coins
-            self.config.live.approved_coins.short = st.session_state.pbcoindata.approved_coins
-            self.config.live.ignored_coins.long = st.session_state.pbcoindata.ignored_coins
-            self.config.live.ignored_coins.short = st.session_state.pbcoindata.ignored_coins
-        # Remove unavailable coins
-        for symbol in self.config.live.approved_coins.long.copy():
-            if symbol not in st.session_state.pbcoindata.symbols:
-                self.config.live.approved_coins.long.remove(symbol)
-        for symbol in self.config.live.approved_coins.short.copy():
-            if symbol not in st.session_state.pbcoindata.symbols:
-                self.config.live.approved_coins.short.remove(symbol)
-        for symbol in self.config.live.ignored_coins.long.copy():
-            if symbol not in st.session_state.pbcoindata.symbols:
-                self.config.live.ignored_coins.long.remove(symbol)
-        for symbol in self.config.live.ignored_coins.short.copy():
-            if symbol not in st.session_state.pbcoindata.symbols:
-                self.config.live.ignored_coins.short.remove(symbol)
+            approved, ignored = coindata.filter_mapping(
+                exchange=exchange_id,
+                market_cap_min_m=self.config.pbgui.market_cap,
+                vol_mcap_max=self.config.pbgui.vol_mcap,
+                only_cpt=self.config.pbgui.only_cpt,
+                notices_ignore=self.config.pbgui.notices_ignore,
+                tags=self.config.pbgui.tags,
+                quote_filter=None,
+                use_cache=True,
+            )
+            self.config.live.approved_coins.long = approved
+            self.config.live.approved_coins.short = approved
+            self.config.live.ignored_coins.long = ignored
+            self.config.live.ignored_coins.short = ignored
+        # Remove unavailable coins (source-of-truth filtering in CoinData)
+        symbols, _ = coindata.filter_mapping(
+            exchange=exchange_id,
+            market_cap_min_m=0,
+            vol_mcap_max=float("inf"),
+            only_cpt=False,
+            notices_ignore=False,
+            tags=[],
+            quote_filter=None,
+            use_cache=True,
+            active_only=True,
+        )
+        notices_by_coin = {}
+        mapping = coindata.load_mapping(exchange=exchange_id, use_cache=True)
+        for record in mapping:
+            coin = (record.get("coin") or "").upper()
+            notice = str(record.get("notice") or "").strip()
+            if coin and notice and coin in symbols and coin not in notices_by_coin:
+                notices_by_coin[coin] = notice
+        symbol_set = set(symbols)
+
+        self.config.live.approved_coins.long = [
+            coin for coin in self.config.live.approved_coins.long if coin in symbol_set
+        ]
+        self.config.live.approved_coins.short = [
+            coin for coin in self.config.live.approved_coins.short if coin in symbol_set
+        ]
+        self.config.live.ignored_coins.long = [
+            coin for coin in self.config.live.ignored_coins.long if coin in symbol_set
+        ]
+        self.config.live.ignored_coins.short = [
+            coin for coin in self.config.live.ignored_coins.short if coin in symbol_set
+        ]
         # Remove from approved_coins when in ignored coins
         for symbol in self.config.live.ignored_coins.long:
             if symbol in self.config.live.approved_coins.long:
@@ -507,79 +583,75 @@ class V7Instance():
             st.session_state.edit_run_v7_ignored_coins_short = self.config.live.ignored_coins.short
         # Find coins with notices
         for coin in list(set(self.config.live.approved_coins.long + self.config.live.approved_coins.short)):
-            if coin in st.session_state.pbcoindata.symbols_notices:
-                st.warning(f'{coin}: {st.session_state.pbcoindata.symbols_notices[coin]}')
+            base = normalize_symbol(coin)
+            notice = notices_by_coin.get(coin) or notices_by_coin.get(base)
+            if notice:
+                st.warning(f'{base}: {notice}')
         # Select approved and ignored coins
         col1, col2 = st.columns([1,1], vertical_alignment="bottom")
         with col1:
-            st.multiselect('approved_coins_long', st.session_state.pbcoindata.symbols, key="edit_run_v7_approved_coins_long", help=pbgui_help.approved_coins)
-            st.multiselect('ignored_symbols_long', st.session_state.pbcoindata.symbols, key="edit_run_v7_ignored_coins_long", help=pbgui_help.ignored_coins)
+            st.multiselect('approved_coins_long', symbols, key="edit_run_v7_approved_coins_long", help=pbgui_help.approved_coins)
+            st.multiselect('ignored_symbols_long', symbols, key="edit_run_v7_ignored_coins_long", help=pbgui_help.ignored_coins)
         with col2:
-            st.multiselect('approved_coins_short', st.session_state.pbcoindata.symbols, key="edit_run_v7_approved_coins_short", help=pbgui_help.approved_coins)
-            st.multiselect('ignored_symbols_short', st.session_state.pbcoindata.symbols, key="edit_run_v7_ignored_coins_short", help=pbgui_help.ignored_coins)
+            st.multiselect('approved_coins_short', symbols, key="edit_run_v7_approved_coins_short", help=pbgui_help.approved_coins)
+            st.multiselect('ignored_symbols_short', symbols, key="edit_run_v7_ignored_coins_short", help=pbgui_help.ignored_coins)
 
     def fragment_market_cap(self):
         if "edit_run_v7_market_cap" in st.session_state:
             if st.session_state.edit_run_v7_market_cap != self.config.pbgui.market_cap:
                 self.config.pbgui.market_cap = st.session_state.edit_run_v7_market_cap
-                st.session_state.pbcoindata.market_cap = self.config.pbgui.market_cap
                 if st.session_state.edit_run_v7_apply_filters:
                     st.rerun()
         else:
             st.session_state.edit_run_v7_market_cap = round(self.config.pbgui.market_cap, 2)
-            st.session_state.pbcoindata.market_cap = self.config.pbgui.market_cap
         st.number_input("market_cap", min_value=0, step=50, format="%.d", key="edit_run_v7_market_cap", help=pbgui_help.market_cap)
 
     def fragment_vol_mcap(self):
         if "edit_run_v7_vol_mcap" in st.session_state:
             if st.session_state.edit_run_v7_vol_mcap != self.config.pbgui.vol_mcap:
                 self.config.pbgui.vol_mcap = st.session_state.edit_run_v7_vol_mcap
-                st.session_state.pbcoindata.vol_mcap = self.config.pbgui.vol_mcap
                 if st.session_state.edit_run_v7_apply_filters:
                     st.rerun()
         else:
             st.session_state.edit_run_v7_vol_mcap = round(self.config.pbgui.vol_mcap, 2)
-            st.session_state.pbcoindata.vol_mcap = self.config.pbgui.vol_mcap
         st.number_input("vol/mcap", min_value=0.0, step=0.05, format="%.2f", key="edit_run_v7_vol_mcap", help=pbgui_help.vol_mcap)
 
     def fragment_tags(self):
+        if "pbcoindata" not in st.session_state:
+            st.session_state.pbcoindata = CoinData()
+        coindata = st.session_state.pbcoindata
+        exchange_id = self._users.find_exchange(self.user)
+        available_tags = coindata.get_mapping_tags(exchange=exchange_id, use_cache=True)
+
         if "edit_run_v7_tags" in st.session_state:
             if st.session_state.edit_run_v7_tags != self.config.pbgui.tags:
                 self.config.pbgui.tags = st.session_state.edit_run_v7_tags
-                st.session_state.pbcoindata.tags = self.config.pbgui.tags
                 if st.session_state.edit_run_v7_apply_filters:
                     st.rerun()
         else:
             # Remove tags that are no longer available
-            for tag in self.config.pbgui.tags:
-                if tag not in st.session_state.pbcoindata.all_tags:
-                    self.config.pbgui.tags.remove(tag)
+            self.config.pbgui.tags = [tag for tag in self.config.pbgui.tags if tag in available_tags]
             st.session_state.edit_run_v7_tags = self.config.pbgui.tags
-            st.session_state.pbcoindata.tags = self.config.pbgui.tags
-        st.multiselect("Tags", st.session_state.pbcoindata.all_tags, key="edit_run_v7_tags", help=pbgui_help.coindata_tags)
+        st.multiselect("Tags", available_tags, key="edit_run_v7_tags", help=pbgui_help.coindata_tags)
 
     def fragment_only_cpt(self):
         if "edit_run_v7_only_cpt" in st.session_state:
             if st.session_state.edit_run_v7_only_cpt != self.config.pbgui.only_cpt:
                 self.config.pbgui.only_cpt = st.session_state.edit_run_v7_only_cpt
-                st.session_state.pbcoindata.only_cpt = self.config.pbgui.only_cpt
                 if st.session_state.edit_run_v7_apply_filters:
                     st.rerun()
         else:
             st.session_state.edit_run_v7_only_cpt = self.config.pbgui.only_cpt
-            st.session_state.pbcoindata.only_cpt = self.config.pbgui.only_cpt
         st.checkbox("only_cpt", help=pbgui_help.only_cpt, key="edit_run_v7_only_cpt")
     
     def fragment_notices_ignore(self):
         if "edit_run_v7_notices_ignore" in st.session_state:
             if st.session_state.edit_run_v7_notices_ignore != self.config.pbgui.notices_ignore:
                 self.config.pbgui.notices_ignore = st.session_state.edit_run_v7_notices_ignore
-                st.session_state.pbcoindata.notices_ignore = self.config.pbgui.notices_ignore
                 if st.session_state.edit_run_v7_apply_filters:
                     st.rerun()
         else:
             st.session_state.edit_run_v7_notices_ignore = self.config.pbgui.notices_ignore
-            st.session_state.pbcoindata.notices_ignore = self.config.pbgui.notices_ignore
         st.checkbox("notices ignore", help=pbgui_help.notices_ignore, key="edit_run_v7_notices_ignore")
 
     @st.fragment
@@ -695,6 +767,12 @@ class V7Instance():
             with col2:
                 self.fragment_warmup_concurrency()
             with col3:
+                self.fragment_enable_archive_candle_fetch()
+            with col4:
+                self.fragment_max_ohlcv_fetches_per_minute()
+
+            col1, col2, col3, col4 = st.columns([1,1,1,1])
+            with col1:
                 self.fragment_max_concurrent_api_requests()
 
         #Filters
@@ -714,11 +792,31 @@ class V7Instance():
        
         # Display dynamic_ignore
         if self.config.pbgui.dynamic_ignore:
-            for coin in st.session_state.pbcoindata.approved_coins:
-                if coin in st.session_state.pbcoindata.symbols_notices:
-                    st.warning(f'{coin}: {st.session_state.pbcoindata.symbols_notices[coin]}')
-            st.code(f'approved_symbols: {st.session_state.pbcoindata.approved_coins}', wrap_lines=True)
-            st.code(f'dynamic_ignored symbols: {st.session_state.pbcoindata.ignored_coins}', wrap_lines=True)
+            if "pbcoindata" not in st.session_state:
+                st.session_state.pbcoindata = CoinData()
+            coindata = st.session_state.pbcoindata
+            exchange_id = self._users.find_exchange(self.user)
+            approved, ignored = coindata.filter_mapping(
+                exchange=exchange_id,
+                market_cap_min_m=self.config.pbgui.market_cap,
+                vol_mcap_max=self.config.pbgui.vol_mcap,
+                only_cpt=self.config.pbgui.only_cpt,
+                notices_ignore=self.config.pbgui.notices_ignore,
+                tags=self.config.pbgui.tags,
+                quote_filter=None,
+                use_cache=True,
+            )
+            notices_by_coin = {}
+            for record in coindata.load_mapping(exchange=exchange_id, use_cache=True):
+                coin = (record.get("coin") or "").upper()
+                notice = str(record.get("notice") or "").strip()
+                if coin and notice and coin not in notices_by_coin:
+                    notices_by_coin[coin] = notice
+            for coin in approved:
+                if coin in notices_by_coin:
+                    st.warning(f'{coin}: {notices_by_coin[coin]}')
+            st.code(f'approved_symbols: {approved}', wrap_lines=True)
+            st.code(f'dynamic_ignored symbols: {ignored}', wrap_lines=True)
 
         # Edit coin_overrides
         self.config.view_coin_overrides()
@@ -873,10 +971,3 @@ class V7Instances:
            if user == instance.user:
                return True
         return False
-
-
-def main():
-    print("Don't Run this Class from CLI")
-
-if __name__ == '__main__':
-    main()
