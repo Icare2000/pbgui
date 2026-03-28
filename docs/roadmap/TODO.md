@@ -154,6 +154,59 @@ Ziel: Ideen sauber festhalten, priorisieren und mit klaren Ergebniskriterien ums
 
 ---
 
+## P1 – Unified WebSocket + VPS Error Management
+
+### Unified WebSocket `/ws/app`
+**Ziel**
+- Ein einziger WebSocket-Endpoint für die gesamte Anwendung (Navigation, Dashboard, VPS, Errors).
+
+**Hintergrund**
+- Aktuell existieren `/ws/dashboard` (nav + widget updates) und `/ws/vps` (VPS state, logs, commands) als getrennte Endpoints.
+- Jeder Client subscribed nur die Topics die er braucht (`vps_error_summary`, `vps_state`, `nav`, etc.).
+- In der Streamlit-Phase ergeben sich max. 2 Connections pro Seite (nav_bridge + error_banner als getrennte iframes). Sobald Streamlit weg ist → 1 WS pro Tab.
+
+**Umfang**
+- Neuer Endpoint `/ws/app` mit Topic-basiertem Subscribe (`{cmd: "subscribe", topics: [...]}`).
+- Messages multiplexed über `type`-Feld: `nav_request`, `dashboard_action`, `dashboard_data`, `vps_state`, `vps_error_summary`, `vps_logs`, `ack_result`, etc.
+- Bestehende `/ws/dashboard` und `/ws/vps` bleiben parallel (nicht brechen), werden schrittweise migriert.
+
+**Migration**
+1. `/ws/app` Endpoint mit Topic-Subscribe → ~50 Zeilen
+2. VPS Error Summary Topic + Ack-Command → ~40 Zeilen
+3. Error Banner HTML (`frontend/vps_error_banner.html`) → ~200 Zeilen
+4. `has_vps_errors()` → Banner ersetzen → ~10 Zeilen
+5. nav_bridge auf `/ws/app` migrieren (später)
+6. Dashboard-Widgets auf `/ws/app` migrieren (später)
+7. VPS Monitor auf `/ws/app` migrieren (später)
+8. `/ws/dashboard` + `/ws/vps` deprecaten (letzter Schritt)
+
+**Done wenn**
+- `/ws/app` existiert und wird von mindestens Error-Banner + nav_bridge genutzt.
+- Alte Endpoints funktionieren weiterhin (Übergang).
+
+### VPS Error Acknowledgement
+**Ziel**
+- VPS-Fehler bestätigen können; bestätigte Fehler tauchen erst wieder auf wenn sich die Anzahl deutlich erhöht hat.
+
+**Umfang**
+- Ack-State in `VPSStore` (in-memory) + persistiert in `data/vps_error_acks.json`.
+- WS-Command `{cmd: "ack_error", key: "server::instance"}` und `{cmd: "ack_all_errors"}` über `/ws/app`.
+- Sichtbarkeitslogik: Fehler erst wieder sichtbar wenn `current_et >= acked_et + delta` (delta konfigurierbar via MonitorConfig).
+- History: Array der letzten 20 Acks pro Key (Timestamp + Counts beim Ack).
+- Error-Banner (`vps_error_banner.html`): collapsible (localStorage), live via WS, Ack-Buttons pro Instanz + Ack All.
+- Ersetzt bestehende `has_vps_errors()` + `PBRemote.has_error()` Streamlit-Logik.
+
+**Future: Push-basierte Fehlererfassung**
+- PBRun/PBRemote auf Remote-VPS können bei Error-Detection direkt `POST /api/vps/error_event` an PBGui senden.
+- VPSStore updated → WS push → Banner zeigt Fehler innerhalb 1 Sekunde (kein SSH-Polling-Delay).
+
+**Done wenn**
+- Error-Banner auf allen Seiten sichtbar (ersetzt `st.expander`).
+- Ack funktioniert persistent (überlebt Server-Restart + Browser-Wechsel).
+- Fehler tauchen nach Ack erst bei deutlichem Anstieg wieder auf.
+
+---
+
 ## P2 – Längerfristig
 
 ### Hyperliquid Rate-Limit Budget Tracking (PB7)
@@ -174,6 +227,82 @@ Ziel: Ideen sauber festhalten, priorisieren und mit klaren Ergebniskriterien ums
 - Bots drosseln koordiniert, bevor 429 eintritt.
 - Funktioniert auch bei Server-Neustart (alle Bots gleichzeitig).
 - Kein Performanceverlust im Normalbetrieb.
+
+---
+
+### PBData: Ressourcen-Schonende Architektur (Dashboard-getriebene Live-Daten)
+**Ziel**
+- PBData-Speicherverbrauch von ~840 MB auf ~150–200 MB reduzieren.
+- Private WebSocket-Verbindungen im Hintergrund eliminieren; WS nur noch wo wirklich sinnvoll.
+
+**Hintergrund**
+- manibot01: 1.8 GB RAM total, PBData allein frisst 840 MB + 3.1 GB Swap.
+- Ursache: ccxtpro-Instanz pro User lädt intern `load_markets()` (Binance: ~500 Symbole), dazu WS-Tasks für Balance + Positions + Orders für alle 54 User gleichzeitig (~162 potenzielle Tasks).
+- Netzwerkprobleme (SSL-Fehler, Timeout-Kaskaden) kommen vermutlich von Ressourcenüberlastung durch Swapping.
+
+**Design: Drei-Schichten-Modell**
+
+*Layer 1 – Background (immer aktiv, nur REST):*
+- History, Executions, Balances per REST-Polling → schreibt in SQLite DB.
+- KEIN privater WebSocket mehr im Hintergrund.
+- Schrittweise Migration: Orders-WS → Balance-WS → Positions-WS entfernen.
+
+*Layer 2 – Live-Session (nur wenn Dashboard offen, ≤10 User):*
+- FastAPI öffnet Exchange-REST-Polling oder WS auf Anfrage.
+- Lifecycle: open bei Dashboard-open, close nach 30s Inaktivität → RAM sofort frei.
+- Shared Preis-WS pro Exchange (kein Auth, ref-counted): offen solange min. 1 Session aktiv.
+- Nur HL-Positions wirklich via WS (Push-Events), alle anderen via REST alle 5–10s.
+- Daten leben im RAM, nicht in DB geschrieben.
+- Streamt via SSE an Browser.
+
+*Layer 3 – Browser (Vanilla JS):*
+- Initialer Render aus DB-Snapshot (sofort).
+- Live-Patches via SSE drüber legen.
+- "All Users"-View: nur DB, kein Live-Stream.
+- ≤10 Selected Users: Live-Session starten.
+
+**Was WS wirklich braucht vs. nicht:**
+| Daten-Typ | WS sinnvoll? |
+|---|---|
+| Positionen (HL) | Ja – Push-Events |
+| Positionen (Binance/Bybit) | Nein – REST alle 5s genug |
+| Balances | Nein – REST alle 60s genug |
+| Orders | Nein – REST alle 10s genug |
+| Preise/Ticker | Ja – shared, kein Auth, hohe Frequenz |
+| History/PnL/Executions | Nein – immer aus DB |
+
+**Migrationsweg (schrittweise):**
+1. Orders-WS entfernen → REST-Combined-Poller übernimmt → sofort ~18 WS weniger
+2. Balance-WS entfernen → REST alle 60s → weitere ~18 WS weniger
+3. Positions-WS entfernen (nicht-HL) → REST alle 10s
+4. FastAPI Live-Session API + SSE-Stream bauen
+5. HL-Positions-WS in Live-Session integrieren
+6. Background komplett WS-frei
+
+**Done wenn**
+- PBData RAM unter 250 MB im normalen Betrieb.
+- Keine privaten WS im Hintergrund (nur shared Preis-WS auf Anfrage).
+- Dashboard zeigt Live-Daten via SSE wenn ≤10 User selected.
+- "All Users"-View funktioniert weiterhin aus DB.
+
+---
+
+### Dashboard: Gridstack.js – Flexibles Widget-Layout
+**Ziel**
+- Dashboard-Editor von festem Zeile×Spalte-Raster auf ein freies Grid-Layout umstellen.
+- Widgets frei platzierbar, beliebig breit (1/3, 1/2, 2/3, voll) und beliebig hoch.
+
+**Umfang**
+- Gridstack.js (MIT, Vanilla JS, ~30 KB) als Layout-Engine einbinden.
+- Datenmodell von `dashboard_type_R_C` auf eine geordnete Widget-Liste mit `{type, x, y, w, h}` umstellen.
+- Migration bestehender Dashboard-Configs (Zeile/Spalte → x/y/w/h Mapping).
+- Drag & Drop, Resize-Handles, Auto-Packing über Gridstack.
+- Bisherige manuelle Wide/Narrow-Logik entfällt komplett.
+
+**Done wenn**
+- Widgets frei verschiebbar und resizebar per Drag & Drop.
+- Alte 1-Spalten- und 2-Spalten-Configs werden automatisch migriert.
+- Editor- und View-Only-Modus funktionieren mit neuem Layout.
 
 ---
 

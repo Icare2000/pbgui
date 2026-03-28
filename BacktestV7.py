@@ -81,9 +81,7 @@ class BacktestV7QueueItem():
         try:
             if self.pid and psutil.pid_exists(self.pid) and (any(sub.lower().endswith("backtest.py") for sub in psutil.Process(self.pid).cmdline())):
                 return True
-        except psutil.NoSuchProcess:
-            pass
-        except psutil.AccessDenied:
+        except (psutil.NoSuchProcess, psutil.ZombieProcess, psutil.AccessDenied):
             pass
         return False
 
@@ -1516,8 +1514,8 @@ class BacktestV7Item(ConfigV7Editor):
                 st.rerun()
         with col2:
             if st.button("Cancel"):
-                # Restore the textarea to current config for next open
-                st.session_state.import_backtest_v7_config = json.dumps(self.config.config, indent=4)
+                # Remove widget key so it gets re-initialised on next dialog open
+                st.session_state.pop("import_backtest_v7_config", None)
                 st.rerun()
 
 class BacktestV7Result:

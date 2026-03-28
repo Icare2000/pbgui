@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 import warnings
@@ -27,11 +28,14 @@ from time import sleep
 
 import psutil
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from api.api_keys import router as api_keys_router
+from api.dashboard import router as dashboard_router
+from api.dashboards import router as dashboards_router
 from api.jobs import router as jobs_router
 from api.market_data import router as market_data_router
 from api.heatmap import router as heatmap_router
@@ -40,6 +44,41 @@ from logging_helpers import human_log as _log
 from pbgui_purefunc import PBGDIR, load_ini, save_ini
 
 SERVICE = "PBApiServer"
+
+# ── Server-restart watchdog (serial.txt) ─────────────────────
+
+_SERIAL_FILE = Path(__file__).parent / "api" / "serial.txt"
+_startup_serial: int = 0
+_needs_restart: bool = False
+_sse_subscribers: list[asyncio.Queue] = []
+
+
+def _read_serial() -> int:
+    """Read current serial from api/serial.txt; return 0 on error."""
+    try:
+        return int(_SERIAL_FILE.read_text().strip())
+    except Exception:
+        return 0
+
+
+async def _serial_watcher_loop() -> None:
+    """Watch api/serial.txt via inotify; set _needs_restart and notify SSE clients."""
+    global _needs_restart
+    from watchfiles import awatch
+    _log(SERVICE, "[serial-watcher] started", level="INFO")
+    try:
+        async for _ in awatch(str(_SERIAL_FILE)):
+            current = _read_serial()
+            if current != _startup_serial:
+                _needs_restart = True
+                _log(SERVICE, f"[serial-watcher] serial changed {_startup_serial}→{current} — restart needed", level="WARNING")
+                for q in list(_sse_subscribers):
+                    try:
+                        await q.put(True)
+                    except Exception:
+                        pass
+    except asyncio.CancelledError:
+        _log(SERVICE, "[serial-watcher] stopped", level="INFO")
 
 
 # ── Route uvicorn logs through human_log ─────────────────────
@@ -79,6 +118,53 @@ def _setup_uvicorn_logging():
 
 _vps_monitor = None
 
+# ── Task-worker watchdog ──────────────────────────────────────
+
+_WATCHDOG_INTERVAL_S = 60  # check every 60 seconds
+
+
+async def _worker_watchdog_loop() -> None:
+    """Periodically restart task_worker if it's dead but jobs are waiting.
+
+    This prevents the queue from silently stalling when the worker process
+    crashes or is killed without cleanly transitioning its jobs back to
+    pending state (e.g. SIGKILL). The fix mirrors the auto-restart logic
+    that exists in the old Streamlit polling panel but runs at the API-server
+    level so it fires regardless of which UI is open.
+    """
+    from task_queue import list_jobs, read_worker_pid, is_pid_running, clear_worker_pid
+    _log(SERVICE, "[watchdog] task-worker watchdog started", level="INFO")
+    while True:
+        try:
+            await asyncio.sleep(_WATCHDOG_INTERVAL_S)
+            active = list_jobs(states=["pending", "running"], limit=1)
+            if not active:
+                continue
+            pid = read_worker_pid()
+            if pid and is_pid_running(int(pid)):
+                continue
+            # Worker is dead but jobs are queued — restart it.
+            try:
+                clear_worker_pid()
+                subprocess.Popen(
+                    [sys.executable, str(Path(__file__).resolve().parent / "task_worker.py")],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                )
+                _log(
+                    SERVICE,
+                    "[watchdog] auto-restarted task_worker (worker dead, active jobs found)",
+                    level="WARNING",
+                )
+            except Exception as e:
+                _log(SERVICE, f"[watchdog] failed to restart task_worker: {e}", level="ERROR")
+        except asyncio.CancelledError:
+            _log(SERVICE, "[watchdog] task-worker watchdog stopped", level="INFO")
+            return
+        except Exception as e:
+            _log(SERVICE, f"[watchdog] unexpected error: {e}", level="ERROR")
+
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
@@ -86,18 +172,53 @@ async def _lifespan(app: FastAPI):
     global _vps_monitor
     from master.async_monitor import VPSMonitor
     from master.async_logs import AsyncLogStreamer
+    from master.file_sync import FileSyncWorker
     from api.vps import init as vps_init
+    from api.api_keys import init_file_sync
+
+    global _startup_serial
+    _startup_serial = _read_serial()
+    _log(SERVICE, f"[serial-watcher] startup serial: {_startup_serial}", level="INFO")
 
     monitor = VPSMonitor()
     streamer = AsyncLogStreamer(monitor.pool)
     vps_init(monitor, streamer)
+
+    file_sync = FileSyncWorker(monitor.pool, monitor.store, monitor)
+    init_file_sync(file_sync)
+
+    # Register on-connect callback so inotifywait watchers start automatically
+    # whenever a VPS connects or reconnects (including after network outages).
+    monitor.pool.set_on_connect_callback(file_sync.start_watchers_single)
+
     _vps_monitor = monitor
     await monitor.start()
 
+    # Start watchers for hosts that are already connected after startup
+    connected_now = monitor.pool.connected_hosts()
+    if connected_now:
+        await file_sync.start_watchers(connected_now)
+    file_sync.start_watchdog()
+
+    watchdog_task = asyncio.create_task(_worker_watchdog_loop(), name="worker-watchdog")
+    serial_task = asyncio.create_task(_serial_watcher_loop(), name="serial-watcher")
+
     yield  # app runs here
 
+    watchdog_task.cancel()
+    serial_task.cancel()
+    try:
+        await watchdog_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await serial_task
+    except asyncio.CancelledError:
+        pass
     if _vps_monitor:
         await _vps_monitor.stop()
+    file_sync.stop_watchdog()
+    await file_sync.stop_watchers()
 
 
 # ── FastAPI app ───────────────────────────────────────────────
@@ -155,6 +276,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(api_keys_router, prefix="/api/api-keys", tags=["api-keys"])
+app.include_router(dashboard_router, prefix="/api/dashboard", tags=["dashboard"])
+app.include_router(dashboards_router, prefix="/api/dashboards", tags=["dashboards"])
 app.include_router(jobs_router, prefix="/api/jobs", tags=["jobs"])
 app.include_router(market_data_router, prefix="/api", tags=["market-data"])
 app.include_router(heatmap_router, prefix="/api/heatmap", tags=["heatmap"])
@@ -169,18 +293,19 @@ if frontend_dir.exists():
 
 active_connections: list[WebSocket] = []
 
+# Set of active /ws/dashboard connections (notified by PBData via internal POST)
+dashboard_ws_clients: set[WebSocket] = set()
+
 
 @app.websocket("/ws/jobs")
 async def websocket_jobs(websocket: WebSocket):
     """WebSocket endpoint for real-time job updates."""
-    await websocket.accept()
     from api.auth import validate_token
-    token = websocket.query_params.get("token")
-    session = validate_token(token) if token else None
-    if not session:
-        await websocket.send_json({"error": "Invalid or missing token"})
-        await websocket.close(code=1008)
+    token = websocket.query_params.get("token", "")
+    if not validate_token(token):
+        await websocket.close(code=4001)
         return
+    await websocket.accept()
     active_connections.append(websocket)
     try:
         while True:
@@ -204,14 +329,12 @@ async def websocket_jobs(websocket: WebSocket):
 @app.websocket("/ws/market-data")
 async def websocket_market_data(websocket: WebSocket):
     """WebSocket endpoint for real-time market data status updates."""
-    await websocket.accept()
     from api.auth import validate_token
-    token = websocket.query_params.get("token")
-    session = validate_token(token) if token else None
-    if not session:
-        await websocket.send_json({"error": "Invalid or missing token"})
-        await websocket.close(code=1008)
+    token = websocket.query_params.get("token", "")
+    if not validate_token(token):
+        await websocket.close(code=4001)
         return
+    await websocket.accept()
     exchange = websocket.query_params.get("exchange", "").lower().strip()
     if not exchange:
         await websocket.send_json({"error": "Missing exchange parameter"})
@@ -286,12 +409,10 @@ async def websocket_market_data(websocket: WebSocket):
 @app.websocket("/ws/heatmap-watch")
 async def websocket_heatmap_watch(websocket: WebSocket):
     """WebSocket endpoint: sends {type: 'updated', mtime: float} when data files change."""
-    from api.auth import verify_token
+    from api.auth import validate_token
     from api.heatmap import _latest_mtime
     token = websocket.query_params.get("token", "")
-    try:
-        verify_token(token)
-    except Exception:
+    if not validate_token(token):
         await websocket.close(code=4001)
         return
     exchange = websocket.query_params.get("exchange", "")
@@ -310,6 +431,284 @@ async def websocket_heatmap_watch(websocket: WebSocket):
         pass
     except Exception as e:
         _log(SERVICE, f"[ws/heatmap-watch] Error: {e}", level="ERROR")
+
+
+@app.websocket("/ws/dashboard")
+async def websocket_dashboard(websocket: WebSocket):
+    """WebSocket endpoint for dashboard live updates.
+
+    Clients receive {"type": "balance_updated"} whenever PBData writes
+    fresh balance/position data to the database.
+    """
+    from api.auth import validate_token
+    token = websocket.query_params.get("token", "")
+    if not validate_token(token):
+        await websocket.close(code=4001)
+        return
+    await websocket.accept()
+    dashboard_ws_clients.add(websocket)
+    try:
+        while True:
+            await asyncio.sleep(60)  # keep-alive; real pushes come from /api/internal/notify/balance
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        _log(SERVICE, f"[ws/dashboard] Error: {e}", level="ERROR")
+    finally:
+        dashboard_ws_clients.discard(websocket)
+
+
+@app.websocket("/ws/candles")
+async def websocket_candles(websocket: WebSocket):
+    """WebSocket endpoint for live chart updates (Phase 2).
+
+    Clients subscribe by connecting with ?token=...&user=...&symbol=...&tf=...
+    They receive pre-formatted messages:
+      {"type": "candle",   "candle":   [t,o,h,l,c,v]}
+      {"type": "position", "position": {entry,size,upnl,side} | null}
+      {"type": "orders",   "orders":   [{price,amount,side}, ...]}
+    Data comes from ccxt.pro live streams when available, with polling fallback.
+    """
+    from api.auth import validate_token
+    from api.dashboard import (register_chart_client, unregister_chart_client,
+                                _set_event_loop)
+    token = websocket.query_params.get("token", "")
+    if not validate_token(token):
+        await websocket.close(code=4001)
+        return
+
+    user = websocket.query_params.get("user", "")
+    symbol = websocket.query_params.get("symbol", "")
+    tf = websocket.query_params.get("tf", "4h")
+
+    if not user or not symbol:
+        await websocket.close(code=4002)
+        return
+
+    await websocket.accept()
+
+    # Store event loop reference for the polling thread
+    _set_event_loop(asyncio.get_running_loop())
+
+    # One unified asyncio.Queue receives candle, position, and order messages
+    q: asyncio.Queue = asyncio.Queue(maxsize=200)
+    await register_chart_client(user, symbol, tf, q)
+
+    try:
+        while True:
+            try:
+                msg = await asyncio.wait_for(q.get(), timeout=30)
+                await websocket.send_json(msg)
+            except asyncio.TimeoutError:
+                # No data for 30s — send heartbeat to detect dead connections
+                try:
+                    await asyncio.wait_for(
+                        websocket.send_json({"type": "ping"}), timeout=5
+                    )
+                except Exception:
+                    break
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        _log(SERVICE, f"[ws/candles] Error: {e}", level="ERROR")
+    finally:
+        await unregister_chart_client(user, symbol, tf, q)
+
+
+@app.post("/api/internal/notify/balance")
+async def internal_notify_balance(request: Request):
+    """Internal endpoint called by PBData after writing balance/position data.
+
+    Broadcasts {"type": "balance_updated"} to all connected /ws/dashboard clients.
+    Only accepts requests from localhost.
+    """
+    client_host = request.client.host if request.client else ""
+    if client_host not in ("127.0.0.1", "::1", "localhost"):
+        raise HTTPException(status_code=403, detail="Internal endpoint")
+    dead: set[WebSocket] = set()
+    for ws in list(dashboard_ws_clients):
+        try:
+            await ws.send_json({"type": "balance_updated"})
+        except Exception:
+            dead.add(ws)
+    dashboard_ws_clients.difference_update(dead)
+    return {"ok": True, "notified": len(dashboard_ws_clients)}
+
+
+@app.post("/api/internal/notify/income")
+async def internal_notify_income(request: Request):
+    """Internal endpoint called by PBData after writing history/income data.
+
+    Broadcasts {"type": "income_updated", "user": "<name>"} to all /ws/dashboard clients.
+    Clients filter by their configured user list — only reload when relevant.
+    Only accepts requests from localhost.
+    """
+    client_host = request.client.host if request.client else ""
+    if client_host not in ("127.0.0.1", "::1", "localhost"):
+        raise HTTPException(status_code=403, detail="Internal endpoint")
+    try:
+        body = await request.json()
+        user_name = body.get("user", "") if isinstance(body, dict) else ""
+    except Exception:
+        user_name = ""
+    dead: set[WebSocket] = set()
+    for ws in list(dashboard_ws_clients):
+        try:
+            await ws.send_json({"type": "income_updated", "user": user_name})
+        except Exception:
+            dead.add(ws)
+    dashboard_ws_clients.difference_update(dead)
+    return {"ok": True, "notified": len(dashboard_ws_clients)}
+
+
+@app.post("/api/internal/notify/positions")
+async def internal_notify_positions(request: Request):
+    """Internal endpoint called by PBData after writing position data.
+
+    Reads the updated positions from DB and pushes them directly to all chart
+    WebSocket subscribers watching that user (via dashboard._refresh_positions_for_user).
+    This ensures the Orders widget entry line is corrected when PBData reconciles
+    a position that was missed due to a WebSocket keepalive outage.
+    Only accepts requests from localhost.
+    """
+    client_host = request.client.host if request.client else ""
+    if client_host not in ("127.0.0.1", "::1", "localhost"):
+        raise HTTPException(status_code=403, detail="Internal endpoint")
+    try:
+        body = await request.json()
+        user_name = body.get("user", "") if isinstance(body, dict) else ""
+    except Exception:
+        user_name = ""
+    try:
+        from api.dashboard import refresh_positions_for_user
+        await asyncio.get_running_loop().run_in_executor(
+            None, refresh_positions_for_user, user_name
+        )
+    except Exception:
+        pass
+    return {"ok": True}
+
+
+@app.post("/api/nav/request")
+async def nav_request(request: Request):
+    """Universal navigation bridge.
+
+    Widget iframes POST ``{page: "...", params: {...}}`` here.
+    The payload is broadcast as ``{type: "nav_request", ...}`` to all
+    ``/ws/dashboard`` WebSocket clients.  A tiny Streamlit component
+    (``nav_bridge``) listens for this message type and calls
+    ``st.switch_page()`` on the Python side.
+    """
+    from api.auth import validate_token as _vt
+
+    # Accept token from header or body
+    auth = request.headers.get("Authorization", "")
+    token = auth.replace("Bearer ", "") if auth.startswith("Bearer ") else ""
+    body: dict = {}
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not token:
+        token = body.get("token", "")
+    if not _vt(token):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    page = body.get("page", "")
+    action = body.get("action", "")
+    params = body.get("params", {})
+    if not page and not action:
+        raise HTTPException(status_code=400, detail="Missing 'page' or 'action'")
+
+    if action:
+        _valid_actions = {
+            'select_dashboard', 'new_dashboard', 'edit_dashboard',
+            'save_dashboard', 'cancel_edit', 'delete_dashboard', 'refresh',
+        }
+        if action not in _valid_actions:
+            raise HTTPException(status_code=400, detail="Invalid action")
+        payload = {"type": "dashboard_action", "action": action, "params": params}
+    else:
+        payload = {"type": "nav_request", "page": page, "params": params}
+    dead: set[WebSocket] = set()
+    for ws in list(dashboard_ws_clients):
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            dead.add(ws)
+    dashboard_ws_clients.difference_update(dead)
+    return {"ok": True, "notified": len(dashboard_ws_clients)}
+
+
+# ── Docs endpoints ────────────────────────────────────────────
+
+@app.get("/api/docs/index")
+async def docs_index(lang: str = "EN", token: str = ""):
+    """Return the list of help topics for the given language.
+
+    Returns ``[{title: str, file: str}, ...]`` where ``file`` is the bare
+    filename (e.g. ``00_overview.md``) and ``title`` is the first ``#``
+    heading or the filename.
+    """
+    from api.auth import validate_token
+    if not validate_token(token):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    ln = str(lang or "EN").strip().upper()
+    root = Path(__file__).parent / "docs"
+    folder = "help_de" if ln == "DE" else "help"
+    docs_dir = root / folder
+    if not docs_dir.is_dir():
+        return []
+
+    result = []
+    for p in sorted(docs_dir.glob("*.md")):
+        title = p.name
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                first = f.readline().strip()
+            if first.startswith("#"):
+                title = first.lstrip("#").strip() or p.name
+        except Exception:
+            pass
+        result.append({"title": title, "file": p.name})
+    return result
+
+
+@app.get("/api/docs/content")
+async def docs_content(file: str, lang: str = "EN", token: str = ""):
+    """Return the raw Markdown text for a help file.
+
+    ``file`` must be a bare filename (no path separators), ``*.md`` only,
+    and must exist in the appropriate ``docs/help[_de]/`` directory.
+    """
+    from api.auth import validate_token
+    if not validate_token(token):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # Reject path traversal and non-markdown files
+    safe_name = Path(file).name
+    if safe_name != file or not safe_name.endswith(".md") or "/" in file or "\\" in file:
+        raise HTTPException(status_code=400, detail="Invalid file parameter")
+
+    ln = str(lang or "EN").strip().upper()
+    root = Path(__file__).parent / "docs"
+    folder = "help_de" if ln == "DE" else "help"
+    full_path = (root / folder / safe_name).resolve()
+
+    # Must remain within the docs dir (additional safety)
+    if not str(full_path).startswith(str((root / folder).resolve())):
+        raise HTTPException(status_code=400, detail="Invalid file parameter")
+
+    if not full_path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    try:
+        content = full_path.read_text(encoding="utf-8")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Read error: {e}")
+
+    return {"content": content}
 
 
 # ── REST endpoints ────────────────────────────────────────────
@@ -343,6 +742,93 @@ def health():
         "status": "ok",
         "websocket_clients": len(active_connections)
     }
+
+
+@app.get("/api/server-status/stream")
+async def server_status_stream(token: str = ""):
+    """SSE stream: pushes {needs_restart: bool} immediately, then on every serial change."""
+    from api.auth import validate_token
+    if not validate_token(token):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    queue: asyncio.Queue = asyncio.Queue()
+    _sse_subscribers.append(queue)
+
+    async def event_gen():
+        try:
+            # Send initial state immediately
+            yield f"data: {json.dumps({'needs_restart': _needs_restart})}\n\n"
+            while True:
+                try:
+                    # wait for change notification (or 25s keepalive)
+                    await asyncio.wait_for(queue.get(), timeout=25)
+                    yield f"data: {json.dumps({'needs_restart': _needs_restart})}\n\n"
+                except asyncio.TimeoutError:
+                    # keepalive comment so proxies don't close the connection
+                    yield ": keepalive\n\n"
+        except (GeneratorExit, asyncio.CancelledError):
+            pass
+        finally:
+            if queue in _sse_subscribers:
+                _sse_subscribers.remove(queue)
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/api/server-restart")
+async def server_restart(request: Request):
+    """Restart the API server process. Auth required."""
+    from api.auth import validate_token
+    auth = request.headers.get("Authorization", "")
+    token = auth.replace("Bearer ", "") if auth.startswith("Bearer ") else ""
+    if not token:
+        try:
+            body = await request.json()
+            token = body.get("token", "") if isinstance(body, dict) else ""
+        except Exception:
+            pass
+    if not validate_token(token):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    _log(SERVICE, "[restart] restart requested by user", level="WARNING")
+
+    async def _do_restart():
+        await asyncio.sleep(0.3)  # let response reach the client first
+        pbgdir = Path(__file__).resolve().parent
+        venv_python = None
+        for candidate in [
+            pbgdir.parent / "venv_pbgui" / "bin" / "python",
+            pbgdir.parent / "venv_pbgui312" / "bin" / "python",
+            pbgdir.parent / "venv" / "bin" / "python",
+            Path(sys.executable),
+        ]:
+            if candidate.exists():
+                venv_python = candidate
+                break
+        if venv_python:
+            # Delete the PID file BEFORE spawning the new process so the new
+            # process doesn't see "Already running" and exit immediately.
+            pid_file = Path(PBGDIR) / "data" / "pid" / "api_server.pid"
+            pid_file.unlink(missing_ok=True)
+            subprocess.Popen(
+                [str(venv_python), str(pbgdir / "PBApiServer.py")],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                cwd=str(pbgdir),
+            )
+            await asyncio.sleep(0.5)  # give new process time to write its PID
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    asyncio.create_task(_do_restart())
+    return {"ok": True, "message": "Restarting…"}
 
 
 class PBApiServer:

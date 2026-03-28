@@ -7,7 +7,7 @@
 I offer API-Service where I run passivbot for you as a Service.
 Just contact me on Telegram for more information.
 
-# v1.66
+# v1.69
 
 ### Overview
 Passivbot GUI (pbgui) is a WEB Interface for Passivbot programed in python with streamlit
@@ -322,6 +322,68 @@ Edit pbguipath in the start.bat to your pbgui installation path
 Add start.bat to Windows Task Scheduler and use Trigger "At system startup"
 
 # Changelog
+
+## v1.69 (28-03-2026)
+- Fix: SSH Sync — secondary master did not pull api-keys on startup if remote serial was already higher than local (no inotify event triggered); `_fetch_remote_state()` now pulls when `remote_serial > local_serial`, with `_sync_lock` check
+- Fix: SSH Sync pull — pulled api-keys were only written to pb7 path, not pb6; both paths are now updated atomically with individual backups; startup check (`_sync_local_pb6_from_pb7`) repairs existing masters where pb6 serial is behind pb7
+- Fix: `info_market_data.py` — replaced deprecated `Series.view("int64")` with `astype("int64")` to suppress pandas FutureWarning
+- Improved: API Keys guide (EN + DE) — completely rewritten for v1.69; covers all new features incl. new "Keeping secondary masters in sync" SSH Sync section
+- Improved: Help overlay — content search; fixed false matches by replacing TreeWalker DOM approach with innerHTML-based regex; larger input field
+- Improved: Help overlay — global search checkbox ("All") next to search field: searches across all topics, shows clickable result cards with highlighted snippets; click a card to open that topic and apply the search term
+- Improved: Frontend CSS — migrated all hardcoded `font-size` values to CSS design tokens (`var(--fs-xs/sm/base/md/lg/xl)`) across all 11 FastAPI frontend HTML files and `css/app.css`; tokens defined in `:root` / scoped root vars per file
+- Improved: FastAPI navbar (`pbgui_nav.js`) — all hardcoded font-sizes replaced with `var(--fs-*)` tokens; nav group/item text upgraded from `0.82rem` → `var(--fs-base)` (14px) for better readability
+- New: API Keys — complete rewrite to FastAPI backend + Vanilla JS standalone page with Dashboard-style topnav; `frontend/pbgui_nav.js` shared nav bar for future FastAPI pages; direct navigation between standalone pages (API Keys ↔ Dashboards) without Streamlit detour
+- New: API Keys — SSH push (`☁ SSH Sync`): distribute `api-keys.json` to all VPS via SSH/SFTP with backup, MD5 verify, retention cleanup, and selective bot restart (only bots for changed users); live 🔴/🟢 sync status via SSE; Advanced Sync panel with per-VPS control, dry-run mode, and retention settings
+- New: API Keys — Hyperliquid & Bybit key expiry: bulk check, per-user buttons, badges color-coded by days remaining (green/yellow/red/black); configurable Telegram warning threshold via PBMon
+- New: API Keys — Backup/Restore panel: timestamped backup list with diff viewer and one-click restore; "Current (live)" entry for diff comparison
+- New: API Keys — TradFi data provider config: yfinance, Alpaca, Polygon, Finnhub, Alpha Vantage; install/test/save; all credentials masked with show/hide toggle (reveals real stored value from backend)
+- New: API Keys — user renaming, required field validation, comment management (`_comment_*` keys), show/hide toggle on all credential fields
+- New: API Keys — `📋 Logs` sidebar button: inline live log viewer (`LogViewerPanel` reusable class) with collapsible left-sidebar file picker, level filtering, search/filter, and configurable initial lines; SSH/VPS logs consolidated in `ApiKeys.log`
+- New: Serial-based API server restart detection (`api/serial.txt` + SSE); orange Restart button in nav bar for API-level changes
+- Improved: API Keys — Guide button opens local FastAPI docs overlay (EN/DE topics); guide completely rewritten
+- Improved: API Keys — browser refresh restores open panel and user via URL hash/params; CSS fade-in on panel transitions; sort/filter state persisted in URL params
+- Improved: API Keys — keyboard navigation (arrow keys + Enter in user table, Escape closes panels), auto-focus filter on load, unsaved-changes confirmation on Back
+- Improved: API Keys — error/warning messages as centered modal dialogs; HL Expiry column sortable; sidebar badges enlarged; CSS design tokens (`--fs-*`) throughout
+- Improved: VPS Monitor — "Debug logging" toggle in API Server settings controls verbose per-cycle log entries; persists in `pbgui.ini`
+- Improved: PBData income history polling now runs one task per exchange in parallel
+- Fix: Dashboard — names with special characters (`<`, `>`, `.`) caused a load error; validation regex now allows all printable characters except path separators (`/`, `\`)
+- Fix: VPS Monitor — monitoring agent and log streamer (`tail -f`) processes were never terminated on task cancel, causing zombie processes on VPS servers; PPID-watcher thread added for TCP-drop cleanup
+- Fix: Spot View (Single) — showed no instances; `Instance.load()` now correctly restores `_market_type` after `user.setter`
+
+## v1.68 (23-03-2026)
+- Fix: Dashboard — WebSocket connection now established on page load; live `income_updated` and `balance_updated` events from PBData are received and widgets refresh automatically
+- Fix: Dashboard — WS-triggered widget refreshes no longer cause flicker; content stays visible during background fetch (spinner only on first load); Plotly charts update in-place via `Plotly.react()` without clearing the DOM; chart animations disabled (`transition.duration:0`); WS rebuild events debounced 300 ms; per-cell generation counter discards stale out-of-order responses
+- Fix: Dashboard — resize handle double-click resets a cell to auto-height (fits visible rows)
+- New: Dashboard view mode — "💾 Layout saved" status bar always visible at the top of the view; turns into a clickable "💾 Save layout" button after any widget swap or cell resize; returns to neutral state after a successful save
+- Improved: Dashboard editor — per-cell height is persisted across saves; resize handle (bottom-right drag strip) adjusts height of any cell and immediately relayouts Plotly charts to fill the new height
+- Improved: Dashboard Balance widget header — icon and totals group flush-left, Users dropdown and trash button pushed to the right via `margin-left:auto`; removed excess spacing caused by `justify-content:space-between`
+- Fix: Orders widget — stale Entry price line is now correctly cleared when a position is closed during a WebSocket keepalive outage
+- Fix: PBData — race condition in `_ws_restarted_once` during mass-disconnect events; key now claimed before first `await`
+- Fix: PBData — memory leaks in unbounded state dicts/sets; periodic `_cleanup_stale_state()` prunes entries for removed users
+- Fix: PBData — silent API notification failures now logged at DEBUG level
+- Fix: PBData — `_price_watch_timeout` and `_rest_semaphore_acquire_timeout` now reloadable from `pbgui.ini`
+- Fix: PBData — `_load_settings()` timer/interval block was nested inside `if log_level changed`; dedented so all settings reload independently
+- Fix: PBData — `eval()` replaced with `ast.literal_eval()` in `load_fetch_users` / `load_trades_users` (security)
+- Fix: PBData — dead/unreachable code in price watcher removed; duplicate `except` handlers merged
+- Fix: PBData — combined poller now uses REST slot gating to prevent rate-limit violations
+- Fix: PBData — duplicate `_rest_semaphore_limits_by_exchange` and `_default_rest_semaphore_limit` definitions consolidated
+- Fix: PBData — atomic INI writes in `save_fetch_users` / `save_trades_users` (temp file + `os.replace`)
+- Fix: PBData — removed dead `threading.Lock` fallback for `_price_buffer_lock`
+- Fix: PBData — `_load_settings()` throttled to every 30s in WS loops (was on every message)
+- Fix: PBData — O(n²) user filtering replaced with set-based list comprehension
+- Fix: PBData — `asynccontextmanager` import moved to module level; debounce flusher outer catch now logs traceback
+
+## v1.67 (22-03-2026)
+- Fix: PBData — added per-exchange `asyncio.Semaphore(2)` to all three WS keepalive handlers (balance, positions, orders); when a server-side event drops all N connections simultaneously, at most 2 reconnects proceed concurrently per exchange, spreading the reconnect storm over several seconds and preventing event-loop congestion that caused cascading ping-pong failures on other exchanges
+- New: Dashboard page fully migrated to pure FastAPI + Vanilla JS — no Streamlit polling, no iframes; editor and live view are standalone HTML pages served by the API server, embedded via `st.html`
+- New: Dashboard editor — grid-based layout with configurable column count and per-cell height; drag-to-swap widgets in live view by dragging the widget title bar; resize cells via a bottom-right drag handle
+- New: Dashboard widgets: ⚖️ Balance, 📊 PNL, 📈 ADG, 📉 P+L, 💰 Income, 🏆 Top, 📋 Positions, 📝 Orders — all configurable per cell (users, period, mode)
+- New: 📝 **Orders widget** — candlestick chart powered by **TradingView Lightweight Charts**; shows open buy/sell orders and entry price as horizontal lines directly on the chart; live candle and uPnL updates via WebSocket; click a row in the Positions widget to instantly load its chart; supports 1m–1w timeframes with full-screen mode
+- New: Dashboard templates — pre-built layouts can be applied with one click; templates can be renamed and deleted; user-created dashboards saved per name to disk; sidebar lists dashboards alphabetically
+- Improved: Dashboard Balance widget — live updates via WebSocket push, custom user dropdown with text filter, sortable columns, stale-instance guard; user selection persisted across saves
+- Fix: `psutil.ZombieProcess` now caught in all process-detection loops (`OptimizeV7`, `BacktestV7`, `PBRun`, `PBRemote`) — prevents Streamlit crash after ~130k optimizer iterations when zombie subprocesses appear in the process table
+- Fix: Task-worker watchdog added to `PBApiServer` — checks every 60 s whether the `task_worker` process is alive; auto-restarts it if jobs are pending/running but the worker is dead (previously a crashed worker could leave the entire job queue stalled indefinitely)
+- Fix: VPS log streaming now recovers automatically after a transient SSH connection drop — `_stream_worker` retries up to 5 times (waiting up to 60 s per attempt for reconnect) instead of permanently marking the stream inactive; SSH keepalive interval also reduced from 15 s → 10 s for faster dead-connection detection
 
 ## v1.66 (07-03-2026)
 - Fix: Market data loop timer accuracy — fetch interval now correctly excludes processing time; all 3 exchange loops (HL, Binance, Bybit) subtract elapsed fetch duration so the next cycle starts on schedule

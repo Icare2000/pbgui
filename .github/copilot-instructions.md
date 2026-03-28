@@ -1,5 +1,17 @@
 # Copilot instructions (pbgui)
 
+## ⛔ MANDATORY — Before finishing ANY task
+
+These three steps are REQUIRED after every change, no exception:
+
+1. **Changelog** — Add entry to `README.md` under `# Changelog` → current `(unreleased)` version. NEVER skip, even for small fixes.
+2. **serial.txt** — If ANY file under `api/`, `PBApiServer.py`, or any module imported at API startup was changed: increment `api/serial.txt` by 1.
+3. **Commit/push** — ALWAYS ask user before committing or pushing.
+
+Failure to do steps 1–2 is a bug, not an oversight.
+
+---
+
 ## Release workflow
 
 - Release steps are in `RELEASING.md`.
@@ -30,6 +42,8 @@
 - **NEVER make large unsolicited design changes**: no module rewrites, file deletions, architecture overhauls, or replacing/deleting existing code without explicit user confirmation. Always propose first, ask, wait for "Yes" — then implement.
 - **Never extend the scope of a task on your own**: if you think something additional should be done, ask first — never silently do more than was requested.
 - **Stop immediately when the original request is satisfied**: do not write additional scripts, run extra tests, or take further actions beyond exactly what was asked. If something seems useful, ask first — never just do it.
+- **Always ask before committing and pushing**: never commit or push code without explicit user confirmation first.
+- **Never deploy/copy files to manibot01 (or any remote server) without explicit user permission**: do not use `rsync`, `scp`, `ssh` file writes, or any other method to push changes to remote servers unless the user explicitly asks for it in the current request.
 - **Symbol resolution always uses the mapping file** (`data/coindata/{exchange}/mapping.json`) — never ad-hoc CCXT market fetches or hardcoded prefix lists. For USDT linear perps filter on `quote == "USDT"` and `swap == True`. See `bybit_best_1m.py` (`_get_bybit_usdt_symbol`) and `binance_best_1m.py` (`_get_binance_symbol`) as reference implementations.
 - GUI language is English throughout; only guides/tutorials are offered in both English and German.
 - **Logging architecture (3-tier model)**:
@@ -41,6 +55,12 @@
   - All logs go to `data/logs/` — never to any other directory.
   - **No direct `print()` or `logging.xxx`** in GUI modules — exclusively use `_log('ServiceName', msg, level='...')` via `from logging_helpers import human_log as _log`.
 - **Migrate everything to FastAPI**: whenever code needs to be rewritten, always prefer a pure FastAPI + Vanilla JS approach (REST endpoints + WebSocket, no JS frameworks). We are gradually migrating away from Streamlit — no new Streamlit polling fragments, no `run_every`, no `st.components.v1.html()` iframes. Use `st.html(unsafe_allow_javascript=True)` only as the thin embedding shim; all logic, state, and updates go through FastAPI. Frontend is always plain Vanilla JS — no React, no Vue, no jQuery.
+- **st.html vs iframe embedding rule**: Use `st.html(unsafe_allow_javascript=True)` when the component needs dynamic height (collapsible sections, expandable content). Use `st.components.v1.iframe()` when the component has a fixed/known height (tables, dashboards). **Critical**: `st.html` passes through DOMPurify with `SAFE_FOR_XML=true` (Streamlit 1.54+), which checks `/<[/\w!]/.test(scriptElement.innerHTML)` and **removes the entire `<script>` element** if it matches. Therefore: all `<` and `>` inside JS string literals in `st.html` components MUST be escaped as `\x3C` / `\x3E`. Comparison operators must be spaced (`a < b`, not `a<b`). iframe-loaded components (e.g. `jobs_monitor.html`) are NOT affected — they run as standalone pages via FastAPI without DOMPurify. When migrating to pure FastAPI, bulk-replace `\x3C`→`<` and `\x3E`→`>`.
+- **st.html JS validation rule**: When creating or editing `st.html` components with `<script>` blocks, always validate the JS first by extracting the script content and running `node --check` on it. Common pitfall: `\x3C`/`\x3E` hex escapes are only valid inside JS **string literals** — using them as comparison operators (e.g. `v \x3C 100`) causes a silent `SyntaxError` that kills the entire script block without any visible error. Operators must use real `<` `>` (with spaces for DOMPurify safety).
+- **API server restart detection via `api/serial.txt`**: The file `api/serial.txt` contains a single integer (e.g. `1`). The running server reads it at startup and compares via inotify/SSE. **Whenever you change FastAPI code that requires a server restart** (any file under `api/`, `PBApiServer.py`, or any module imported at startup), you MUST increment the number in `api/serial.txt` by 1. This triggers the orange "Restart" button in the nav bar for all connected users. Never forget to bump the serial after API-level changes.
+- **Changelog discipline**: After every feature or bugfix, immediately add an entry to the `# Changelog` section in `README.md` under the current unreleased version. Never finish a task without updating the changelog. Do NOT use a separate `CHANGELOG.md` file.
+- **Changelog versioning rule**: Once a version entry in `README.md # Changelog` has a date (e.g. `## v1.68 (23-03-2026)`), never add new entries to it unless the user explicitly requests it. Instead, create a new version section above it with `(unreleased)` (e.g. `## v1.69 (unreleased)`) and add new entries there. When releasing, the `(unreleased)` label gets replaced with the release date.
+- **Release version heading**: When releasing a version, always update the standalone version heading `# vX.YY` in `README.md` (around line 10). NEVER add a version number to the main title `# GUI for Passivbot` — that line stays version-free.
 
 ## Repo boundaries (important)
 
@@ -181,3 +201,13 @@
   - Document with docstrings: module, class, and function level
 - Write clear, focused tests with descriptive names and assertion messages.
 - See `tests/README.md` for complete testing documentation.
+
+---
+
+## ⛔ REMINDER — BEFORE YOU FINISH (check this every single time)
+
+1. ✅ **Changelog** added to `README.md` → `# Changelog` → `(unreleased)` section?
+2. ✅ **`api/serial.txt`** incremented if `api/`, `PBApiServer.py`, or frontend files changed?
+3. ✅ **Not committing/pushing** without explicit user confirmation?
+
+If any answer is NO — go back and fix it before responding.
