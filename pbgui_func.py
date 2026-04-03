@@ -2,7 +2,6 @@ import streamlit as st
 import streamlit.components.v1 as _st_components
 import json
 
-PBGUI_VERSION = "v1.69"
 import hjson
 import pprint
 import uuid
@@ -10,7 +9,7 @@ import requests
 import os
 from time import sleep
 from pathlib import Path
-from pbgui_purefunc import load_ini, save_ini, load_symbols_from_ini as _load_symbols_from_mapping
+from pbgui_purefunc import load_ini, save_ini, load_symbols_from_ini as _load_symbols_from_mapping, PBGUI_VERSION, PBGDIR
 # LogHandler removed: centralized debuglog removed per user request
 from PBRemote import PBRemote
 from MonitorConfig import MonitorConfig
@@ -180,7 +179,7 @@ def set_page_config(page : str = "Start"):
         initial_sidebar_state="expanded",
         menu_items={
             'Get help': 'https://github.com/msei99/pbgui/#readme',
-            'About': f"Passivbot GUI {PBGUI_VERSION} [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/Y8Y216Q3QS)"
+            'About': f"Passivbot GUI {PBGUI_VERSION} | API Serial {(PBGDIR / 'api' / 'serial.txt').read_text().strip()} [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/Y8Y216Q3QS)"
         }
     )
     # Global layout CSS — applied on every page
@@ -288,6 +287,127 @@ def build_navigation():
         },position="top"
     )
     st.session_state.navigation = navi
+
+    # ── FastAPI-only pages: dual interception ───────────────────────────────
+    # 1. SERVER-SIDE: if Streamlit somehow runs this page (direct URL / slow
+    #    client), intercept before navi.run() so the page script never runs.
+    # 2. CLIENT-SIDE: inject a history.pushState patch so that ANY Streamlit
+    #    nav-bar click that would navigate to a FastAPI-only page is intercepted
+    #    synchronously in the browser — before Streamlit re-renders — giving a
+    #    true zero-flash direct navigation to FastAPI.
+    # ────────────────────────────────────────────────────────────────────────
+
+    # Resolve API server once; reused by both server-side and client-side paths.
+    _fa_ok = False
+    _fa_port = 0
+    try:
+        _, _fa_port, _fa_ok = _start_fastapi_server_if_needed()
+    except Exception:
+        pass
+
+    # Ensure token exists and is still valid (needed for both paths below).
+    if _fa_ok:
+        _need_token = "api_token" not in st.session_state
+        if not _need_token:
+            try:
+                from api.auth import validate_token
+                if not validate_token(st.session_state["api_token"]):
+                    _need_token = True
+            except Exception:
+                _need_token = True
+        if _need_token:
+            try:
+                from api.auth import generate_token
+                _uid = (st.session_state.get("user", {}).get("id")
+                        or st.session_state.get("user")
+                        or "anonymous")
+                st.session_state["api_token"] = generate_token(str(_uid), expires_in_seconds=86400).token
+            except Exception:
+                pass
+
+    # Derive browser host/port once.
+    _bhost, _sport = "127.0.0.1", 8501
+    try:
+        _rhost = st.context.headers.get("Host", "")
+        if _rhost:
+            _bhost = _rhost.split(":")[0] or "127.0.0.1"
+            if ":" in _rhost:
+                _sport = int(_rhost.split(":")[1])
+    except Exception:
+        pass
+
+    # 1. SERVER-SIDE interception (user is already on the logging page).
+    if navi.url_path == "system_logging":
+        if not is_authenticted() or is_session_state_not_initialized():
+            st.switch_page(paths["SYSTEM_LOGIN"])
+            st.stop()
+        if _fa_ok and "api_token" in st.session_state:
+            _url = (f"http://{_bhost}:{_fa_port}/api/logging/main_page"
+                    f"?token={st.session_state['api_token']}"
+                    f"&st_base=http://{_bhost}:{_sport}")
+            st.html(f'<script>window.location.replace("{_url}");</script>',
+                    unsafe_allow_javascript=True)
+            st.stop()
+        redirect_to_fastapi_logging()   # fallback (also handles error display)
+
+    # 1b. SERVER-SIDE interception for VPS Monitor.
+    if navi.url_path == "system_vps_monitor":
+        if not is_authenticted() or is_session_state_not_initialized():
+            st.switch_page(paths["SYSTEM_LOGIN"])
+            st.stop()
+        if _fa_ok and "api_token" in st.session_state:
+            _url = (f"http://{_bhost}:{_fa_port}/api/vps/main_page"
+                    f"?token={st.session_state['api_token']}"
+                    f"&st_base=http://{_bhost}:{_sport}")
+            st.html(f'<script>window.location.replace("{_url}");</script>',
+                    unsafe_allow_javascript=True)
+            st.stop()
+        redirect_to_fastapi_vps_monitor()
+
+    # 1c. SERVER-SIDE interception for Services.
+    if navi.url_path == "system_services":
+        if not is_authenticted() or is_session_state_not_initialized():
+            st.switch_page(paths["SYSTEM_LOGIN"])
+            st.stop()
+        if _fa_ok and "api_token" in st.session_state:
+            _url = (f"http://{_bhost}:{_fa_port}/api/services/main_page"
+                    f"?token={st.session_state['api_token']}"
+                    f"&st_base=http://{_bhost}:{_sport}")
+            st.html(f'<script>window.location.replace("{_url}");</script>',
+                    unsafe_allow_javascript=True)
+            st.stop()
+        redirect_to_fastapi_services()
+
+    # 2. CLIENT-SIDE history.pushState patch — injected into every other page so
+    #    clicking "Logging" in the Streamlit nav bar redirects directly to FastAPI
+    #    in the browser, without triggering a Streamlit page re-render at all.
+    if _fa_ok and "api_token" in st.session_state:
+        _token = st.session_state["api_token"]
+        _log_url = (f"http://{_bhost}:{_fa_port}/api/logging/main_page"
+                    f"?token={_token}&st_base=http://{_bhost}:{_sport}")
+        _vps_url = (f"http://{_bhost}:{_fa_port}/api/vps/main_page"
+                    f"?token={_token}&st_base=http://{_bhost}:{_sport}")
+        _svc_url = (f"http://{_bhost}:{_fa_port}/api/services/main_page"
+                    f"?token={_token}&st_base=http://{_bhost}:{_sport}")
+        # NOTE: no < or > inside this script — DOMPurify will not strip it.
+        # _pbguiOk guard ensures pushState is only patched once per page load;
+        # _pbguiFaPgs is updated every render so the token stays fresh.
+        st.html(
+            f'<script>'
+            f'window._pbguiFaPgs={{"system_logging":"{_log_url}","system_vps_monitor":"{_vps_url}","system_services":"{_svc_url}"}};'
+            f'if(!history._pbguiOk){{'
+            f'history._pbguiOk=true;'
+            f'var _pp=history.pushState,_pr=history.replaceState;'
+            f'function _pbCheck(u){{var s=String(u||""),p=window._pbguiFaPgs||{{}};'
+            f'for(var k in p){{if(s.indexOf(k)!==-1){{window.location.replace(p[k]);return true;}}}}return false;}}'
+            f'history.pushState=function(a,b,u){{if(!_pbCheck(u))_pp.apply(this,arguments);}};'
+            f'history.replaceState=function(a,b,u){{if(!_pbCheck(u))_pr.apply(this,arguments);}};'
+            f'}}'
+            f'</script>',
+            unsafe_allow_javascript=True,
+        )
+    # ────────────────────────────────────────────────────────────────────────
+
     navi.run()
     
     
@@ -468,17 +588,25 @@ def render_log_viewer(
     except Exception:
         pass
 
-    # Generate / reuse API token for this session
-    from api.auth import generate_token as _gen_token
-    if "api_token" not in __import__('streamlit').session_state:
+    # Generate / reuse API token for this session (refresh if expired)
+    from api.auth import generate_token as _gen_token, validate_token as _val_token
+    _st_mod = __import__('streamlit')
+    _need_tok = "api_token" not in _st_mod.session_state
+    if not _need_tok:
+        try:
+            if not _val_token(_st_mod.session_state["api_token"]):
+                _need_tok = True
+        except Exception:
+            _need_tok = True
+    if _need_tok:
         _user_id = (
-            __import__('streamlit').session_state.get("user", {}).get("id")
-            or __import__('streamlit').session_state.get("user")
+            _st_mod.session_state.get("user", {}).get("id")
+            or _st_mod.session_state.get("user")
             or "anonymous"
         )
         _tok = _gen_token(str(_user_id), expires_in_seconds=86400)
-        __import__('streamlit').session_state["api_token"] = _tok.token
-    _api_token = __import__('streamlit').session_state["api_token"]
+        _st_mod.session_state["api_token"] = _tok.token
+    _api_token = _st_mod.session_state["api_token"]
     logs_dir = Path(__file__).resolve().parent / "data" / "logs"
     log_files: list[str] = []
     if logs_dir.exists():
@@ -566,7 +694,7 @@ def render_fastapi_job_monitor(height: int = 800, exchange: str = "", job_type: 
         exchange: optional exchange filter (e.g. "binanceusdm", "bybit", "hyperliquid")
         job_type: optional job type filter — comma-separated (e.g. "hl_best_1m" or "hl_aws_l2book_auto")
     """
-    from api.auth import generate_token
+    from api.auth import generate_token, validate_token as _vt
     
     # Ensure FastAPI server is running and get config
     api_host, api_port, success = _start_fastapi_server_if_needed()
@@ -576,9 +704,15 @@ def render_fastapi_job_monitor(height: int = 800, exchange: str = "", job_type: 
                  f"Please check **System → Services → API Server** or start manually: `python PBApiServer.py`")
         return
     
-    # Get or create token for current session
-    if "api_token" not in st.session_state:
-        # Use Streamlit's session_id if available, else generate one
+    # Get or create token for current session (refresh if expired)
+    _need_tok = "api_token" not in st.session_state
+    if not _need_tok:
+        try:
+            if not _vt(st.session_state["api_token"]):
+                _need_tok = True
+        except Exception:
+            _need_tok = True
+    if _need_tok:
         user_id = st.session_state.get("user", {}).get("id") or st.session_state.get("user") or "anonymous"
         token_obj = generate_token(str(user_id), expires_in_seconds=86400)
         st.session_state["api_token"] = token_obj.token
@@ -643,6 +777,152 @@ def redirect_to_fastapi_api_keys_editor() -> None:
     st_base = f"http://{browser_host}:{st_port}"
     url = (
         f"http://{browser_host}:{api_port}/api/api-keys/main_page"
+        f"?token={token}"
+        f"&st_base={st_base}"
+    )
+    st.html(
+        f'<script>window.location.replace("{url}");</script>',
+        unsafe_allow_javascript=True,
+    )
+    st.stop()
+
+
+def redirect_to_fastapi_logging() -> None:
+    """Redirect the browser to the standalone FastAPI Logging Monitor page.
+
+    Uses window.location.replace() so the Streamlit chrome is never rendered.
+    The FastAPI /main_page endpoint injects the token server-side.
+    Calls st.stop() on success so nothing else is rendered.
+    """
+    from api.auth import generate_token
+
+    api_host, api_port, success = _start_fastapi_server_if_needed()
+    if not success:
+        st.error(
+            f"⚠️ FastAPI server could not be started on {api_host}:{api_port}. "
+            "Please check **System → Services → API Server** or start manually: "
+            "`python PBApiServer.py`"
+        )
+        return
+
+    if "api_token" not in st.session_state:
+        user_id = (
+            st.session_state.get("user", {}).get("id")
+            or st.session_state.get("user")
+            or "anonymous"
+        )
+        st.session_state["api_token"] = generate_token(str(user_id), expires_in_seconds=86400).token
+
+    token = st.session_state["api_token"]
+
+    browser_host = "127.0.0.1"
+    st_port = 8501
+    try:
+        req_host = st.context.headers.get("Host", "")
+        if req_host:
+            browser_host = req_host.split(":")[0] or "127.0.0.1"
+            if ":" in req_host:
+                st_port = int(req_host.split(":")[1])
+    except Exception:
+        pass
+
+    st_base = f"http://{browser_host}:{st_port}"
+    url = (
+        f"http://{browser_host}:{api_port}/api/logging/main_page"
+        f"?token={token}"
+        f"&st_base={st_base}"
+    )
+    st.html(
+        f'<script>window.location.replace("{url}");</script>',
+        unsafe_allow_javascript=True,
+    )
+    st.stop()
+
+
+def redirect_to_fastapi_services() -> None:
+    """Redirect the browser to the standalone FastAPI Services page."""
+    from api.auth import generate_token
+
+    api_host, api_port, success = _start_fastapi_server_if_needed()
+    if not success:
+        st.error(
+            f"⚠️ FastAPI server could not be started on {api_host}:{api_port}. "
+            "Please check **System → Services → API Server** or start manually: "
+            "`python PBApiServer.py`"
+        )
+        return
+
+    if "api_token" not in st.session_state:
+        user_id = (
+            st.session_state.get("user", {}).get("id")
+            or st.session_state.get("user")
+            or "anonymous"
+        )
+        st.session_state["api_token"] = generate_token(str(user_id), expires_in_seconds=86400).token
+
+    token = st.session_state["api_token"]
+
+    browser_host = "127.0.0.1"
+    st_port = 8501
+    try:
+        req_host = st.context.headers.get("Host", "")
+        if req_host:
+            browser_host = req_host.split(":")[0] or "127.0.0.1"
+            if ":" in req_host:
+                st_port = int(req_host.split(":")[1])
+    except Exception:
+        pass
+
+    st_base = f"http://{browser_host}:{st_port}"
+    url = (
+        f"http://{browser_host}:{api_port}/api/services/main_page"
+        f"?token={token}"
+        f"&st_base={st_base}"
+    )
+    st.html(
+        f'<script>window.location.replace("{url}");</script>',
+        unsafe_allow_javascript=True,
+    )
+    st.stop()
+
+
+def redirect_to_fastapi_vps_monitor() -> None:
+    """Redirect the browser to the standalone FastAPI VPS Monitor page."""
+    from api.auth import generate_token
+
+    api_host, api_port, success = _start_fastapi_server_if_needed()
+    if not success:
+        st.error(
+            f"⚠️ FastAPI server could not be started on {api_host}:{api_port}. "
+            "Please check **System → Services → API Server** or start manually: "
+            "`python PBApiServer.py`"
+        )
+        return
+
+    if "api_token" not in st.session_state:
+        user_id = (
+            st.session_state.get("user", {}).get("id")
+            or st.session_state.get("user")
+            or "anonymous"
+        )
+        st.session_state["api_token"] = generate_token(str(user_id), expires_in_seconds=86400).token
+
+    token = st.session_state["api_token"]
+
+    browser_host = "127.0.0.1"
+    st_port = 8501
+    try:
+        req_host = st.context.headers.get("Host", "")
+        if req_host:
+            browser_host = req_host.split(":")[0] or "127.0.0.1"
+            if ":" in req_host:
+                st_port = int(req_host.split(":")[1])
+    except Exception:
+        pass
+
+    st_base = f"http://{browser_host}:{st_port}"
+    url = (
+        f"http://{browser_host}:{api_port}/api/vps/main_page"
         f"?token={token}"
         f"&st_base={st_base}"
     )

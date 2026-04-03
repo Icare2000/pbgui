@@ -27,6 +27,7 @@
       stBase:   c.stBase   !== undefined ? c.stBase   : (window.ST_BASE  || ''),
       apiBase:  c.apiBase  !== undefined ? c.apiBase  : (window.API_BASE || ''),
       version:  c.version  !== undefined ? c.version  : (window.PBGUI_VERSION || ''),
+      serial:   c.serial   !== undefined ? c.serial   : (window.PBGUI_SERIAL  || ''),
       subtitle: c.subtitle || 'PBGui',
       current:  c.current  || ''
     };
@@ -143,7 +144,8 @@
     'transition:color .12s,background .12s;}',
     '.pbgui-ovl-close:hover{color:#e2e8f0;background:rgba(255,255,255,.06);}',
     '#pbgui-about-body{padding:2rem 2rem 1.5rem;text-align:center;}',
-    '#pbgui-about-ver{font-size:var(--fs-xl);font-weight:800;color:#e2e8f0;margin-bottom:0.25rem;}',
+    '#pbgui-about-ver{font-size:var(--fs-xl);font-weight:800;color:#e2e8f0;margin-bottom:0.2rem;}',
+    '#pbgui-about-serial{font-size:var(--fs-xs);color:#64748b;margin-bottom:0.25rem;}',
     '#pbgui-about-tag{font-size:var(--fs-sm);color:#64748b;letter-spacing:.06em;',
     'text-transform:uppercase;margin-bottom:1.5rem;}',
     '.pbgui-about-divider{width:100%;height:1px;',
@@ -235,7 +237,8 @@
   function buildAbout() {
     if (document.getElementById('pbgui-about-ovl')) return;
     var c = cfg();
-    var ver = esc(c.version || '');
+    var ver    = esc(c.version || '');
+    var serial = esc(c.serial  || '');
     var html = '<div id="pbgui-about-ovl">'
       + '<div id="pbgui-about-box">'
       +   '<div class="pbgui-ovl-header">'
@@ -250,6 +253,7 @@
       +       '<rect x="22" y="9" width="5" height="21" rx="1.5" fill="#3182ce"/>'
       +     '</svg>'
       +     '<div id="pbgui-about-ver">PBGui ' + ver + '</div>'
+      +     (serial ? '<div id="pbgui-about-serial">API Serial ' + serial + '</div>' : '')
       +     '<div id="pbgui-about-tag">Passivbot GUI &mdash; by msei99</div>'
       +     '<div class="pbgui-about-divider"></div>'
       +     '<div class="pbgui-about-links">'
@@ -273,7 +277,10 @@
      ════════════════════════════════════ */
   var FASTAPI_PAGES = {
     'dashboards':        '/api/dashboard/main_page',
-    'system_api_keys':   '/api/api-keys/main_page'
+    'system_api_keys':   '/api/api-keys/main_page',
+    'system_logging':     '/api/logging/main_page',
+    'system_vps_monitor': '/api/vps/main_page',
+    'system_services':    '/api/services/main_page'
   };
 
   /* ════════════════════════════════════
@@ -382,15 +389,54 @@
           headers: { 'Authorization': 'Bearer ' + c2.token, 'Content-Type': 'application/json' },
           body: JSON.stringify({ token: c2.token })
         }).then(function() {
-          setTimeout(function() { window.location.reload(); }, 3000);
+          showRestartOverlay(origin2, c2.token);
         }).catch(function() {
-          setTimeout(function() { window.location.reload(); }, 3000);
+          showRestartOverlay(origin2, c2.token);
         });
       });
     }
 
     /* SSE: watch for needs_restart */
     setupRestartSSE(TOKEN, apiOrigin);
+  }
+
+  function showRestartOverlay(origin, token) {
+    /* Remove any existing overlay first */
+    var existing = document.getElementById('pbgui-restart-overlay');
+    if (existing) existing.remove();
+
+    var ov = document.createElement('div');
+    ov.id = 'pbgui-restart-overlay';
+    ov.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(9,14,26,.92);display:flex;align-items:center;justify-content:center;flex-direction:column;gap:1rem;font-family:sans-serif;';
+    ov.innerHTML =
+      '<div style="color:#e2e8f0;font-size:1.1rem;font-weight:600;">Restarting API Server\u2026</div>' +
+      '<div id="pbgui-restart-status" style="color:#64748b;font-size:0.85rem;">Waiting for server\u2026</div>';
+    document.body.appendChild(ov);
+
+    var attempts = 0;
+    var maxAttempts = 30;
+    var statusEl = document.getElementById('pbgui-restart-status');
+    var apiBase = (origin || window.location.origin);
+
+    function probe() {
+      attempts++;
+      if (statusEl) statusEl.textContent = 'Reconnecting\u2026 (' + attempts + '/' + maxAttempts + ')';
+      fetch(apiBase + '/api/services/status?token=' + encodeURIComponent(token || ''), { cache: 'no-store' })
+        .then(function (r) {
+          if (r.ok) { window.location.reload(); }
+          else { if (attempts < maxAttempts) setTimeout(probe, 2000); else _overlayFail(); }
+        })
+        .catch(function () {
+          if (attempts < maxAttempts) setTimeout(probe, 2000); else _overlayFail();
+        });
+    }
+
+    function _overlayFail() {
+      if (statusEl) statusEl.textContent = 'Server did not respond \u2014 please refresh manually.';
+    }
+
+    /* First probe after PBGUI_RESTART_DELAY (3s) + a small buffer */
+    setTimeout(probe, 4000);
   }
 
   function setupRestartSSE(token, apiOrigin) {
@@ -417,6 +463,58 @@
   }
 
   /* ════════════════════════════════════
+     TOKEN KEEP-ALIVE & 401 REDIRECT
+     ════════════════════════════════════ */
+
+  /* Redirect to Streamlit login when token is invalid/expired. */
+  function redirectToLogin() {
+    var base = cfg().stBase || '';
+    if (base) {
+      window.location.replace(base);
+    } else {
+      window.location.replace('/');
+    }
+  }
+
+  /* Periodically call /api/token-refresh to extend token expiry.
+     Interval: 30 minutes.  If the refresh itself returns 401 we redirect. */
+  var _refreshTimer = null;
+  function startTokenRefresh() {
+    if (_refreshTimer) return;
+    var c = cfg();
+    if (!c.token) return;
+    /* Derive the API root from known page-specific API_BASE values.
+       API_BASE is e.g. "http://host:port/api/services" or "/api/services".
+       Token-refresh lives at /api/token-refresh.  */
+    var apiRoot = '';
+    if (window.API_BASE) {
+      var m = String(window.API_BASE).match(/^(https?:\/\/[^/]+)/);
+      apiRoot = m ? m[1] : '';
+    }
+    function doRefresh() {
+      fetch(apiRoot + '/api/token-refresh?token=' + encodeURIComponent(c.token), { method: 'POST' })
+        .then(function (r) {
+          if (r.status === 401) { redirectToLogin(); }
+        })
+        .catch(function () { /* network error — ignore, will retry next cycle */ });
+    }
+    doRefresh();  /* immediate first refresh on page load */
+    _refreshTimer = setInterval(doRefresh, 30 * 60 * 1000);  /* every 30 min */
+  }
+
+  /* Global 401 interceptor — monkey-patch window.fetch so ANY fetch returning 401
+     triggers a redirect.  This catches background polling, WebSocket auth, etc. */
+  var _origFetch = window.fetch;
+  window.fetch = function () {
+    return _origFetch.apply(this, arguments).then(function (response) {
+      if (response.status === 401) {
+        redirectToLogin();
+      }
+      return response;
+    });
+  };
+
+  /* ════════════════════════════════════
      INIT
      ════════════════════════════════════ */
   function init() {
@@ -424,6 +522,7 @@
     buildNav();
     buildAbout();
     setupHandlers();
+    startTokenRefresh();
   }
 
   if (document.readyState === 'loading') {
@@ -431,5 +530,9 @@
   } else {
     init();
   }
+
+  /* Expose overlay helper so other scripts on the same page (e.g. services_monitor.html)
+     can call it without requiring closure access to this IIFE. */
+  window.showRestartOverlay = showRestartOverlay;
 
 }());

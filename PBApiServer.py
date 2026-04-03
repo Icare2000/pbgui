@@ -28,20 +28,24 @@ from time import sleep
 
 import psutil
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from api.auth import SessionToken, require_auth
 from api.api_keys import router as api_keys_router
 from api.dashboard import router as dashboard_router
 from api.dashboards import router as dashboards_router
 from api.jobs import router as jobs_router
+from api.logging import router as logging_router
 from api.market_data import router as market_data_router
 from api.heatmap import router as heatmap_router
 from api.vps import router as vps_router
+from api.services import router as services_router
+from api.live import router as live_router
 from logging_helpers import human_log as _log
-from pbgui_purefunc import PBGDIR, load_ini, save_ini
+from pbgui_purefunc import PBGDIR, load_ini, save_ini, PBGUI_VERSION
 
 SERVICE = "PBApiServer"
 
@@ -180,6 +184,15 @@ async def _lifespan(app: FastAPI):
     _startup_serial = _read_serial()
     _log(SERVICE, f"[serial-watcher] startup serial: {_startup_serial}", level="INFO")
 
+    # Clean up expired token files on startup
+    try:
+        from api.auth import cleanup_expired_tokens
+        _n = cleanup_expired_tokens()
+        if _n:
+            _log(SERVICE, f"[auth] cleaned up {_n} expired token(s)", level="INFO")
+    except Exception:
+        pass
+
     monitor = VPSMonitor()
     streamer = AsyncLogStreamer(monitor.pool)
     vps_init(monitor, streamer)
@@ -259,7 +272,7 @@ app = FastAPI(
         "**Query params:** `exchange`, `dataset`, `coin` (all required).\n\n"
         "**Server → Client:** `{\"type\": \"updated\", \"mtime\": …}` — sent when the underlying data files change (polls every 5 s).\n"
     ),
-    version="1.65",
+    version=PBGUI_VERSION,
     openapi_tags=[
         {"name": "jobs", "description": "Background job queue — list, cancel, retry, delete, bulk-delete, view logs"},
         {"name": "market-data", "description": "Market data pipeline — status, trigger refresh, cancel, stop"},
@@ -280,9 +293,12 @@ app.include_router(api_keys_router, prefix="/api/api-keys", tags=["api-keys"])
 app.include_router(dashboard_router, prefix="/api/dashboard", tags=["dashboard"])
 app.include_router(dashboards_router, prefix="/api/dashboards", tags=["dashboards"])
 app.include_router(jobs_router, prefix="/api/jobs", tags=["jobs"])
+app.include_router(logging_router, prefix="/api/logging", tags=["logging"])
 app.include_router(market_data_router, prefix="/api", tags=["market-data"])
 app.include_router(heatmap_router, prefix="/api/heatmap", tags=["heatmap"])
 app.include_router(vps_router, tags=["vps"])
+app.include_router(services_router, prefix="/api/services", tags=["services"])
+app.include_router(live_router, prefix="/api/live", tags=["live"])
 
 frontend_dir = Path(__file__).parent / "frontend"
 if frontend_dir.exists():
@@ -782,6 +798,20 @@ async def server_status_stream(token: str = ""):
     )
 
 
+@app.post("/api/token-refresh")
+async def token_refresh(session: SessionToken = Depends(require_auth)):
+    """Extend the current token's expiry by another 24 hours.
+
+    Called periodically by frontend pages to prevent token expiry
+    while the user is actively using the page.
+    """
+    from api.auth import refresh_token
+    updated = refresh_token(session.token)
+    if not updated:
+        raise HTTPException(status_code=401, detail="Token refresh failed")
+    return {"ok": True, "expires_at": updated.expires_at}
+
+
 @app.post("/api/server-restart")
 async def server_restart(request: Request):
     """Restart the API server process. Auth required."""
@@ -817,14 +847,16 @@ async def server_restart(request: Request):
             # process doesn't see "Already running" and exit immediately.
             pid_file = Path(PBGDIR) / "data" / "pid" / "api_server.pid"
             pid_file.unlink(missing_ok=True)
+            env = os.environ.copy()
+            env["PBGUI_RESTART_DELAY"] = "3"  # wait for old process to free the port
             subprocess.Popen(
                 [str(venv_python), str(pbgdir / "PBApiServer.py")],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 close_fds=True,
                 cwd=str(pbgdir),
+                env=env,
             )
-            await asyncio.sleep(0.5)  # give new process time to write its PID
         os.kill(os.getpid(), signal.SIGTERM)
 
     asyncio.create_task(_do_restart())
@@ -995,6 +1027,13 @@ if __name__ == "__main__":
     if server.is_running():
         _log(SERVICE, 'Already running — exit', level='INFO')
         sys.exit(0)
+
+    # When spawned by the restart handler the old process still holds the port.
+    # Wait for it to release before binding.
+    restart_delay = int(os.getenv("PBGUI_RESTART_DELAY", "0"))
+    if restart_delay:
+        sleep(restart_delay)
+
     server.save_pid()
 
     host = os.getenv("PBGUI_API_HOST", server.host)

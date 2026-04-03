@@ -21,8 +21,9 @@ from collections import defaultdict
 import asyncio
 import random
 from logging_helpers import human_log as _human_log, set_service_min_level, is_debug_enabled
-from Exchange import set_ws_limits
+from Exchange import set_ws_limits, Exchange as _Exchange
 from market_data import load_market_data_config, get_daily_hour_coverage_for_dataset, set_enabled_coins
+from rate_limit_budget import RateLimitBudget, EXCHANGE_RATE_LIMITS, get_weight
 from hyperliquid_best_1m import update_latest_hyperliquid_1m_api_for_coin
 from binance_best_1m import update_latest_binance_1m_for_coin
 from inventory_cache import refresh_coin as _refresh_inventory_coin
@@ -215,9 +216,6 @@ class PBData():
         self._trades_users = []
         self.load_fetch_users()
         self.load_trades_users()
-        self._balance_ws_tasks = {}
-        self._position_ws_tasks = {}
-        self._order_ws_tasks = {}
         self._price_exchange_tasks = {}
         self._price_exchange_config = {}
         # Track which symbols we have already subscribed to per exchange
@@ -293,12 +291,21 @@ class PBData():
         self._pollers_enabled_after_ts = datetime.now().timestamp() + self._pollers_delay_seconds
         # Shared poller intervals (seconds)
         self._shared_combined_interval_seconds = 90
-        self._shared_history_interval_seconds = 90
+        self._shared_history_interval_seconds = 300
         self._shared_executions_interval_seconds = 1800
+        # Balance has its own (longer) cadence — purely informational, no rush.
+        self._poll_interval_balance_seconds = 300
+        # Positions cadence — only changes after fills/liquidations.
+        self._poll_interval_positions_seconds = 300
+        # Orders cadence — position-per-symbol calls are expensive on HL; 60 s is still fresh enough.
+        self._poll_interval_orders_seconds = 60
+        # Users whose balance/positions/orders should be refreshed on the next combined cycle
+        # (set by history/executions pollers when new entries are detected).
+        self._balance_stale_users: set = set()
+        self._positions_stale_users: set = set()
+        self._orders_stale_users: set = set()
         # Flag to restart shared poller tasks when intervals change
         self._poll_intervals_changed = False
-        # Track which user/exchange pairs have already logged 'watch_positions not supported'
-        self._watch_positions_not_supported_logged = set()
         self._pbgui_ini_mtime = None
         # Last loaded ws_max value from pbgui.ini (so we only reapply when changed)
         self._ws_max_loaded = None
@@ -313,6 +320,7 @@ class PBData():
         self._network_demotion_window = 60
         # Per-exchange backoff state and error tracking
         self._exchange_backoff_until = {}  # exchange -> timestamp until which we should backoff
+        self._exchange_history_backoff_until = {}  # history-only backoff (long_history_poll) – does NOT block combined poller
         self._exchange_error_timestamps = defaultdict(list)  # exchange -> [ts1, ts2, ...]
         self._error_window_seconds = 30
         self._error_threshold = 6
@@ -345,12 +353,36 @@ class PBData():
         # Metrics task handle
         self._metrics_task = None
         # Metrics sampling interval (seconds), configurable via env PB_METRICS_INTERVAL
-        self._metrics_interval = 60
+        self._metrics_interval = 10
+        # ── Poller metrics (observable via API) ──────────────────
+        # Per-exchange counters / timestamps that the GUI can display.
+        # Written to data/logs/poller_metrics.json every _metrics_interval.
+        self._poller_metrics = defaultdict(lambda: {
+            'combined_last_ts': 0,        # epoch of last combined-poller cycle finish
+            'combined_cycle_ms': 0,       # duration of last combined cycle (ms)
+            'combined_users': 0,          # users polled in last combined cycle
+            'history_last_ts': 0,         # epoch of last history-poller cycle finish
+            'history_cycle_ms': 0,        # duration of last history cycle (ms)
+            'history_users': 0,           # users polled in last history cycle
+            'market_data_last_ts': 0,     # epoch of last market-data cycle finish
+            'market_data_coins': 0,       # coins processed in last market-data cycle
+            'rate_limit_429': 0,          # cumulative 429 count since startup
+            'errors': 0,                  # cumulative error count since startup
+            'rest_slot_timeouts': 0,      # cumulative REST slot timeout count
+        })
+        # ── Rate-limit budgets (token bucket per exchange) ───────
+        self._rate_budgets: dict[str, RateLimitBudget] = {}
+        # Per-exchange lock: ensures only ONE poller (combined/history/executions)
+        # draws from the budget at a time, preventing concurrent token starvation.
+        self._budget_poller_locks: dict[str, asyncio.Lock] = {}
+        for _exch_name, _cfg in EXCHANGE_RATE_LIMITS.items():
+            self._rate_budgets[_exch_name] = RateLimitBudget(**_cfg)
+            self._budget_poller_locks[_exch_name] = asyncio.Lock()
         # (IO debugging disabled) -- per-metrics-cycle DB/process IO logging removed
         # Latest 1m candles (API) auto-refresh settings
         self._latest_1m_enabled = True
         self._latest_1m_interval_seconds = 1800
-        self._latest_1m_coin_pause_seconds = 0.5
+        self._latest_1m_coin_pause_seconds = 2.0
         self._latest_1m_api_timeout_seconds = 30.0
         self._latest_1m_min_lookback_days = 2
         self._latest_1m_max_lookback_days = 4
@@ -401,7 +433,7 @@ class PBData():
         # Tunable per-exchange concurrent REST slots (lower for sensitive exchanges)
         self._rest_semaphore_limits_by_exchange = {
             'bybit': 1,
-            'hyperliquid': 1,
+            'hyperliquid': 2,
         }
         self._default_rest_semaphore_limit = 3
         # How long (s) to wait to acquire a REST slot before skipping the update
@@ -570,6 +602,18 @@ class PBData():
                 if new_exec != getattr(self, '_shared_executions_interval_seconds', 1800):
                     self._shared_executions_interval_seconds = int(new_exec)
                     self._poll_intervals_changed = True
+
+            new_balance = _get_int_opt('pbdata', 'poll_interval_balance_seconds')
+            if new_balance is not None and new_balance > 0:
+                self._poll_interval_balance_seconds = int(new_balance)
+
+            new_positions = _get_int_opt('pbdata', 'poll_interval_positions_seconds')
+            if new_positions is not None and new_positions > 0:
+                self._poll_interval_positions_seconds = int(new_positions)
+
+            new_orders = _get_int_opt('pbdata', 'poll_interval_orders_seconds')
+            if new_orders is not None and new_orders > 0:
+                self._poll_interval_orders_seconds = int(new_orders)
 
             # Latest 1m API fetch interval
             new_latest_1m_interval = _get_int_opt('pbdata', 'latest_1m_interval_seconds')
@@ -828,28 +872,37 @@ class PBData():
                         lookback_days = max_lb
 
                     try:
-                        res = await asyncio.to_thread(
-                            update_latest_hyperliquid_1m_api_for_coin,
-                            coin=coin,
-                            lookback_days=int(lookback_days),
-                            overwrite=False,
-                            dry_run=False,
-                            timeout_s=float(self._latest_1m_api_timeout_seconds),
-                        )
-                        coin_status["last_fetch"] = datetime.now().isoformat(sep=" ", timespec="seconds")
-                        coin_status["result"] = "ok"
-                        coin_status["lookback_days"] = int(lookback_days)
-                        coin_status["newest_day"] = newest_day
-                        coin_status["api_result"] = res
-                        try:
-                            if isinstance(res, dict) and bool(res.get("skipped")) and str(res.get("skip_reason") or "") == "not_in_live_meta":
-                                invalid_live_meta_coins.add(str(coin).strip().upper())
-                        except Exception:
-                            pass
-                        try:
-                            _refresh_inventory_coin("hyperliquid", "1m_api", coin)
-                        except Exception:
-                            pass
+                        # Acquire rate budget for HL candleSnapshot.
+                        # Weight = 44/day (20 base + ceil(1440 candles/60) = 44 per HL docs).
+                        # update_latest_hyperliquid_1m_api_for_coin makes one API call per
+                        # missing day → acquire the full upper bound up-front.
+                        _cs_weight = get_weight('hyperliquid', 'candle_snapshot') * max(1, int(lookback_days))
+                        if not await self._acquire_rate_budget('hyperliquid', 'candle_snapshot', timeout=120.0, weight_override=_cs_weight):
+                            coin_status["last_fetch"] = datetime.now().isoformat(sep=" ", timespec="seconds")
+                            coin_status["result"] = "budget_timeout"
+                        else:
+                            res = await asyncio.to_thread(
+                                update_latest_hyperliquid_1m_api_for_coin,
+                                coin=coin,
+                                lookback_days=int(lookback_days),
+                                overwrite=False,
+                                dry_run=False,
+                                timeout_s=float(self._latest_1m_api_timeout_seconds),
+                            )
+                            coin_status["last_fetch"] = datetime.now().isoformat(sep=" ", timespec="seconds")
+                            coin_status["result"] = "ok"
+                            coin_status["lookback_days"] = int(lookback_days)
+                            coin_status["newest_day"] = newest_day
+                            coin_status["api_result"] = res
+                            try:
+                                if isinstance(res, dict) and bool(res.get("skipped")) and str(res.get("skip_reason") or "") == "not_in_live_meta":
+                                    invalid_live_meta_coins.add(str(coin).strip().upper())
+                            except Exception:
+                                pass
+                            try:
+                                _refresh_inventory_coin("hyperliquid", "1m_api", coin)
+                            except Exception:
+                                pass
                     except Exception as e:
                         coin_status["last_fetch"] = datetime.now().isoformat(sep=" ", timespec="seconds")
                         coin_status["result"] = "error"
@@ -873,6 +926,7 @@ class PBData():
                         status["running"] = False
                         status["current_coin"] = None
                         status["stopped"] = True
+                        status["last_run_duration_s"] = int(datetime.now().timestamp() - now_ts)
                         try:
                             await self._update_market_data_status("latest_1m", status)
                         except Exception:
@@ -915,6 +969,7 @@ class PBData():
 
                 status["running"] = False
                 status["current_coin"] = None
+                status["last_run_duration_s"] = int(datetime.now().timestamp() - now_ts)
                 await self._update_market_data_status("latest_1m", status)
                 if "historical" in status:
                     await self._update_market_data_status("historical", status["historical"])
@@ -1082,6 +1137,7 @@ class PBData():
                         status_bnc["running"] = False
                         status_bnc["current_coin"] = None
                         status_bnc["stopped"] = True
+                        status_bnc["last_run_duration_s"] = int(datetime.now().timestamp() - now_ts)
                         try:
                             await self._update_market_data_status("binance_latest_1m", status_bnc)
                         except Exception:
@@ -1095,6 +1151,7 @@ class PBData():
                 # Merge into market data status (locked to avoid clobbering other loops)
                 status_bnc["running"] = False
                 status_bnc["current_coin"] = None
+                status_bnc["last_run_duration_s"] = int(datetime.now().timestamp() - now_ts)
                 try:
                     await self._update_market_data_status("binance_latest_1m", status_bnc)
                 except Exception:
@@ -1261,6 +1318,7 @@ class PBData():
                         status_bbt["running"] = False
                         status_bbt["current_coin"] = None
                         status_bbt["stopped"] = True
+                        status_bbt["last_run_duration_s"] = int(datetime.now().timestamp() - now_ts)
                         try:
                             await self._update_market_data_status("bybit_latest_1m", status_bbt)
                         except Exception:
@@ -1273,6 +1331,7 @@ class PBData():
                 _resume_after_coin = ""
                 status_bbt["running"] = False
                 status_bbt["current_coin"] = None
+                status_bbt["last_run_duration_s"] = int(datetime.now().timestamp() - now_ts)
                 try:
                     await self._update_market_data_status("bybit_latest_1m", status_bbt)
                 except Exception:
@@ -1775,14 +1834,37 @@ class PBData():
                 except Exception:
                     pass
 
+    async def _acquire_rate_budget(self, exchange: str, operation: str, timeout: float = 60.0, weight_override: int = None) -> bool:
+        """Acquire rate-limit budget tokens for an API operation.
+
+        Returns True if budget was acquired (or exchange has no budget tracking).
+        Returns False if timed out waiting for budget — caller should skip the call.
+        If *weight_override* is given it is used instead of the static table lookup.
+        """
+        budget = self._rate_budgets.get(exchange)
+        if not budget:
+            return True  # no budget tracking for this exchange
+        weight = weight_override if weight_override is not None else get_weight(exchange, operation)
+        acquired = await budget.acquire(weight=weight, timeout=timeout, tag=operation)
+        if not acquired:
+            try:
+                _human_log('PBData', f"[budget] Rate budget timeout for {exchange} op={operation} weight={weight}", level='WARNING')
+            except Exception:
+                pass
+        return acquired
 
     def _set_exchange_backoff(self, exchange: str, reason: str = None, duration: int = None, user=None):
         try:
             now = datetime.now().timestamp()
             dur = duration if duration is not None else self._backoff_duration_seconds
+            # long_history_poll only blocks the history poller, not the combined poller
+            if reason == 'long_history_poll':
+                backoff_dict = self._exchange_history_backoff_until
+            else:
+                backoff_dict = self._exchange_backoff_until
             # If already in backoff, increase duration (exponential-ish) to avoid
             # repeated tight retry loops. Clamp to a reasonable maximum.
-            prev_until = self._exchange_backoff_until.get(exchange, 0)
+            prev_until = backoff_dict.get(exchange, 0)
             prev_remaining = max(0, prev_until - now)
             # If previously backing off, double the remaining time up to max
             if prev_remaining > 0:
@@ -1790,7 +1872,7 @@ class PBData():
             else:
                 new_dur = dur
             until = now + new_dur
-            self._exchange_backoff_until[exchange] = until
+            backoff_dict[exchange] = until
             # Pass username as `user` kwarg to human_log (human_log supports `user`)
             _human_log('PBData', f"[BACKOFF] Entering backoff for exchange {exchange} for {int(new_dur)}s (reason={reason})", level='WARNING', user=getattr(user, 'name', None))
         except Exception:
@@ -1839,6 +1921,16 @@ class PBData():
             if not exchange:
                 return False
             until = self._exchange_backoff_until.get(exchange, 0)
+            return datetime.now().timestamp() < until
+        except Exception:
+            return False
+
+    def _is_exchange_in_history_backoff(self, exchange: str) -> bool:
+        """Return True if the history poller should back off for this exchange (long_history_poll reason)."""
+        try:
+            if not exchange:
+                return False
+            until = self._exchange_history_backoff_until.get(exchange, 0)
             return datetime.now().timestamp() < until
         except Exception:
             return False
@@ -1892,8 +1984,16 @@ class PBData():
                 for exch, until in list(self._exchange_backoff_until.items()):
                     if until > now:
                         backoffs.append(f"{exch}:until={int(until-now)}s")
+                for exch, until in list(self._exchange_history_backoff_until.items()):
+                    if until > now:
+                        backoffs.append(f"{exch}(hist):until={int(until-now)}s")
                 if lines or backoffs:
                     _human_log('PBData', f"[METRICS] Clients: {', '.join(lines)}; Backoffs: {', '.join(backoffs) if backoffs else '(none)'}", level='INFO')
+                # Write poller metrics JSON for the GUI panel
+                try:
+                    self._write_poller_metrics()
+                except Exception:
+                    pass
                 # IO debugging removed: process/db IO summary logging disabled
                 # Periodic cleanup of stale entries in unbounded data structures
                 self._cleanup_stale_state()
@@ -1933,11 +2033,6 @@ class PBData():
                     pass
             for k in stale_keys:
                 self._last_network_error_log_ts.pop(k, None)
-
-            # --- _watch_positions_not_supported_logged: keyed by (user_name, exchange_id) ---
-            stale_keys = {k for k in self._watch_positions_not_supported_logged
-                          if isinstance(k, tuple) and len(k) >= 1 and k[0] not in active_users}
-            self._watch_positions_not_supported_logged -= stale_keys
 
             # --- _ws_success_counts: keyed by (exchange, user_name) ---
             stale_keys = [k for k in self._ws_success_counts
@@ -2225,680 +2320,6 @@ class PBData():
                 pass
             raise
 
-    async def _ensure_balance_watcher(self, user):
-        if user.name not in self.fetch_users:
-            return
-        if user.name in self._balance_ws_tasks:
-            task = self._balance_ws_tasks[user.name]
-            if task and not task.done():
-                return
-        task = asyncio.create_task(self._balance_ws_loop(user))
-        self._balance_ws_tasks[user.name] = task
-
-    async def _reconcile_balance_watchers(self, desired_user_names: set):
-        for uname, task in list(self._balance_ws_tasks.items()):
-            if uname not in desired_user_names:
-                try:
-                    if task and not task.done():
-                        task.cancel()
-                except Exception:
-                    pass
-                self._balance_ws_tasks.pop(uname, None)
-                # Close any private ws client for this user to release resources
-                try:
-                    u = self.users.find_user(uname)
-                    if u:
-                        from Exchange import Exchange
-                        try:
-                            await Exchange.close_private_ws_client(u.exchange, u)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-    async def _reconcile_position_watchers(self, desired_user_names: set):
-        for uname, task in list(self._position_ws_tasks.items()):
-            if uname not in desired_user_names:
-                try:
-                    if task and not task.done():
-                        task.cancel()
-                except Exception:
-                    pass
-                self._position_ws_tasks.pop(uname, None)
-                # Close any private ws client for this user to release resources
-                try:
-                    u = self.users.find_user(uname)
-                    if u:
-                        from Exchange import Exchange
-                        try:
-                            await Exchange.close_private_ws_client(u.exchange, u)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-    async def _reconcile_order_watchers(self, desired_user_names: set):
-        for uname, task in list(self._order_ws_tasks.items()):
-            if uname not in desired_user_names:
-                try:
-                    if task and not task.done():
-                        task.cancel()
-                except Exception:
-                    pass
-                self._order_ws_tasks.pop(uname, None)
-                # Close any private ws client for this user to release resources
-                try:
-                    u = self.users.find_user(uname)
-                    if u:
-                        from Exchange import Exchange
-                        try:
-                            await Exchange.close_private_ws_client(u.exchange, u)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-    async def _balance_ws_loop(self, user):
-        from Exchange import Exchange
-        await asyncio.sleep((hash(user.name) % 5000) / 1000.0)
-        exch = Exchange(user.exchange, user)
-        ex = await self.request_private_client(user.exchange, user, caller='PBData._balance_ws_loop')
-        if not ex:
-            _human_log('PBData', f"[ws] ccxtpro unavailable or unsupported for {user.name} ({user.exchange}); relying on shared balances poller", level='DEBUG')
-            return
-        supports_balance = False
-        try:
-            if hasattr(ex, 'has'):
-                if isinstance(ex.has, dict):
-                    supports_balance = ex.has.get('watchBalance', False)
-                else:
-                    supports_balance = getattr(ex.has, 'watchBalance', False)
-        except Exception:
-            supports_balance = False
-        if not supports_balance:
-            key = (user.name, exch.id)
-            if key not in self._watch_positions_not_supported_logged:
-                _human_log('PBData', f"[ws] watch_balance not supported for {user.name} ({exch.id}); relying on shared balances poller", level='DEBUG')
-                self._watch_positions_not_supported_logged.add(key)
-            return
-        _human_log('PBData', f"[ws] Starting balance watcher for {user.name} ({exch.id})", level='INFO')
-        _last_settings_reload = 0.0
-        try:
-            while True:
-                # Reload settings from pbgui.ini at most every 30s
-                _now = datetime.now().timestamp()
-                if _now - _last_settings_reload >= 30.0:
-                    try:
-                        self._load_settings()
-                    except Exception:
-                        pass
-                    _last_settings_reload = _now
-                try:
-                    # Watch balance; details vary across exchanges
-                    bal = await ex.watch_balance()
-                    # Debug: optionally log payload type and a short preview so we can
-                    # see whether the WS watcher actually returns balance data.
-                    try:
-                        if is_debug_enabled('PBData'):
-                            btype = type(bal)
-                            preview = repr(bal)
-                            if len(preview) > 300:
-                                preview = preview[:300] + '...'
-                            _human_log('PBData', f"[ws] watch_balance payload for {user.name}: type={btype} preview={preview}", level='DEBUG')
-                    except Exception:
-                        if is_debug_enabled('PBData'):
-                            try:
-                                _human_log('PBData', f"[ws] watch_balance payload for {user.name}: (unrepresentable)", level='DEBUG')
-                            except Exception:
-                                pass
-
-                    # On any balance update, debounce and persist balances via background flusher
-                    try:
-                        await self._enqueue_debounce('balances', user)
-                    except Exception as e:
-                        _human_log('PBData', f"[ws->REST] enqueue debounce failed for balances {user.name}: {e}", level='ERROR')
-                except Exception as e:
-                    raw = str(e)
-                    lower = raw.lower()
-                    # If this was a benign/normal close (e.g. code 1000) try a reconnect
-                    if self._is_normal_ws_close(raw):
-                        self._throttled_log_network((user.exchange, user.name), f"[ws] normal websocket close for {user.name}: {e}; attempting reconnect", self._network_error_log_throttle)
-                        try:
-                            ex2 = await self.request_private_client(user.exchange, user, caller='PBData._balance_ws_loop')
-                            if not ex2:
-                                _human_log('PBData', f"[ws] Could not re-acquire private client for {user.name}; falling back to REST", level='WARNING')
-                                try:
-                                    await Exchange.close_private_ws_client(user.exchange, user)
-                                except Exception:
-                                    pass
-                                return
-                            await asyncio.sleep(1)
-                            continue
-                        except Exception:
-                            try:
-                                await Exchange.close_private_ws_client(user.exchange, user)
-                            except Exception:
-                                pass
-                            return
-                    # Detect keepalive/ping-pong style timeouts and attempt one restart
-                    try:
-                        key = (user.exchange, user.name)
-                        # reset consecutive success counter on any exception
-                        try:
-                            self._ws_success_counts[key] = 0
-                        except Exception:
-                            pass
-                        keepalive_triggers = ['ping-pong', 'pingpong', 'keepalive', 'requesttimeout']
-                        if any(k in lower for k in keepalive_triggers) or ('timed out' in lower and 'ping' in lower):
-                            if key not in self._ws_restarted_once:
-                                # Claim the restart slot *before* the first await so no other
-                                # concurrent loop for this user can also enter the restart path.
-                                self._ws_restarted_once.add(key)
-                                _human_log('PBData', f"[ws] Keepalive timeout detected; restarting private ws client for {user.name} ({user.exchange})", level='WARNING')
-                                try:
-                                    await Exchange.close_private_ws_client(user.exchange, user)
-                                except Exception:
-                                    pass
-                                async with self._get_reconnect_sem(user.exchange):
-                                    await asyncio.sleep(self._ws_restart_sleep + random.random() * 0.5)
-                                    try:
-                                        ex2 = await self.request_private_client(user.exchange, user, caller='PBData._balance_ws_loop')
-                                        if ex2:
-                                            ex = ex2
-                                            _human_log('PBData', f"[ws] Restarted private ws client for {user.name} ({user.exchange}); will not restart again until {self._ws_success_required} successful messages", level='INFO')
-                                            continue
-                                    except Exception:
-                                        pass
-                        # If restart already used or recreate failed, fall through to normal handling
-                    except Exception:
-                        pass
-                    # Detect network-level errors (connection closed/reset, remote abort)
-                    network_triggers = ['connection closed', 'networkerror', 'connection reset', 'remote server', 'eof', 'connection aborted', 'broken pipe']
-                    if any(k in lower for k in network_triggers) or isinstance(e, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
-                        _human_log('PBData', f"[ws] watch_balance network error for {user.name}: {e}; considering demotion to REST", level='WARNING')
-                        # Track recent network errors for this exchange and trigger backoff if threshold exceeded
-                        try:
-                            now_ts = datetime.now().timestamp()
-                            l = self._exchange_error_timestamps.get(user.exchange, [])
-                            l.append(now_ts)
-                            # prune
-                            l = [ts for ts in l if now_ts - ts <= self._error_window_seconds]
-                            self._exchange_error_timestamps[user.exchange] = l
-                            if len(l) >= self._error_threshold:
-                                try:
-                                    # include user so backoff log shows which user triggered it
-                                    self._set_exchange_backoff(user.exchange, reason='network_errors', user=user)
-                                    # also close shared client to force reconnect
-                                    from Exchange import Exchange as _ExchCls
-                                    try:
-                                        await _ExchCls.close_shared_ws_client(user.exchange)
-                                    except Exception:
-                                        pass
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-                        # Coordinate demotion per-exchange so only one user is demoted
-                        exch_key = user.exchange
-                        # Ensure a lock exists for this exchange
-                        lock = self._network_error_locks.get(exch_key)
-                        if lock is None:
-                            lock = asyncio.Lock()
-                            self._network_error_locks[exch_key] = lock
-                        async with lock:
-                            now_ts = datetime.now().timestamp()
-                            # Prune stale demotion entries
-                            existing = self._exchange_network_error_users.get(exch_key, {})
-                            stale = [uname for uname, ts in existing.items() if now_ts - ts > self._network_demotion_window]
-                            for s in stale:
-                                existing.pop(s, None)
-                            # If no recent demotions, demote this user
-                            if not existing:
-                                existing[user.name] = now_ts
-                                self._exchange_network_error_users[exch_key] = existing
-                                _human_log('PBData', f"[ws] Demoting {user.name} to REST for exchange {exch_key} (first in window)", level='WARNING')
-                                try:
-                                    await Exchange.close_private_ws_client(user.exchange, user)
-                                except Exception:
-                                    pass
-                                return
-                            else:
-                                # Another user was recently demoted; attempt to keep this user's WS alive
-                                _human_log('PBData', f"[ws] Recent demotion exists for exchange {exch_key}; attempting to keep {user.name} on websocket", level='INFO')
-                                try:
-                                    # Try to re-acquire or recreate a private client for this user
-                                    ex2 = await Exchange.get_private_ws_client(user.exchange, user, caller='PBData._balance_ws_loop')
-                                    if not ex2:
-                                        _human_log('PBData', f"[ws] Could not re-acquire private client for {user.name}; falling back to REST", level='WARNING')
-                                        try:
-                                            await Exchange.close_private_ws_client(user.exchange, user)
-                                        except Exception:
-                                            pass
-                                        return
-                                    # Short backoff before continuing loop to avoid tight error loops
-                                    await asyncio.sleep(1)
-                                    continue
-                                except Exception:
-                                    try:
-                                        await Exchange.close_private_ws_client(user.exchange, user)
-                                    except Exception:
-                                        pass
-                                    return
-        finally:
-            # Intentionally not closing `ex` here. Shared websocket clients are
-            # kept open to avoid disrupting other watchers that may be using
-            # the same client instance.
-            try:
-                _human_log('PBData', f"Leaving ws client open in _balance_ws_loop for {user.name} ({exch.id})", level='DEBUG')
-            except Exception:
-                pass
-            
-
-    async def _ensure_position_watcher(self, user):
-        # Start one WS task per user if not running
-        if user.name not in self.fetch_users:
-            return
-        if user.name in self._position_ws_tasks:
-            task = self._position_ws_tasks[user.name]
-            if task and not task.done():
-                return
-        task = asyncio.create_task(self._position_ws_loop(user))
-        self._position_ws_tasks[user.name] = task
-
-    async def _ensure_order_watcher(self, user):
-        # Start one WS task per user if not running
-        if user.name not in self.fetch_users:
-            return
-        if user.name in self._order_ws_tasks:
-            task = self._order_ws_tasks[user.name]
-            if task and not task.done():
-                return
-        task = asyncio.create_task(self._order_ws_loop(user))
-        self._order_ws_tasks[user.name] = task
-
-    async def _position_ws_loop(self, user):
-        from Exchange import Exchange
-        await asyncio.sleep((hash(user.name) % 5000) / 1000.0)
-        exch = Exchange(user.exchange, user)
-        ex = await self.request_private_client(user.exchange, user, caller='PBData._position_ws_loop')
-        if not ex:
-            _human_log('PBData', f"[ws] ccxtpro unavailable or unsupported (positions) for {user.name} ({user.exchange})", level='DEBUG')
-            return
-        supports_positions = False
-        try:
-            if hasattr(ex, 'has'):
-                if isinstance(ex.has, dict):
-                    supports_positions = ex.has.get('watchPositions', False)
-                else:
-                    supports_positions = getattr(ex.has, 'watchPositions', False)
-        except Exception:
-            supports_positions = False
-        if not supports_positions:
-            key = (user.name, exch.id)
-            if key not in self._watch_positions_not_supported_logged:
-                if key not in self._watch_positions_not_supported_logged:
-                    # Instead of starting a per-user REST poller (which can create many
-                    # concurrent requests), rely on the shared serial poller to update
-                    # positions for exchanges that don't support watchPositions.
-                    _human_log('PBData', f"[ws] watch_positions not supported for {user.name} ({exch.id}); relying on shared positions poller", level='INFO')
-                self._watch_positions_not_supported_logged.add(key)
-            return
-        _human_log('PBData', f"[ws] Starting positions watcher for {user.name} ({exch.id})", level='INFO')
-        min_positions_refresh_interval = 10
-        last_positions_refresh = 0
-        _last_settings_reload = 0.0
-        try:
-            while True:
-                # Reload settings at most every 30s
-                _now = datetime.now().timestamp()
-                if _now - _last_settings_reload >= 30.0:
-                    try:
-                        self._load_settings()
-                    except Exception:
-                        pass
-                    _last_settings_reload = _now
-                try:
-                    _ = await ex.watch_positions()
-                    # Successful watch_positions: increment success counter and clear restart marker after threshold
-                    try:
-                        key = (user.exchange, user.name)
-                        self._ws_success_counts[key] = self._ws_success_counts.get(key, 0) + 1
-                        if self._ws_success_counts.get(key, 0) >= self._ws_success_required:
-                            if key in self._ws_restarted_once:
-                                self._ws_restarted_once.discard(key)
-                                _human_log('PBData', f"[ws] Restart state cleared for {user.name} ({user.exchange}) after {self._ws_success_required} successful watch events", level='INFO')
-                            self._ws_success_counts[key] = 0
-                    except Exception:
-                        pass
-                    now_sec = int(datetime.now().timestamp())
-                    if now_sec - last_positions_refresh >= min_positions_refresh_interval:
-                        last_positions_refresh = now_sec
-                        try:
-                            await self._enqueue_debounce('positions', user)
-                        except Exception as e:
-                            _human_log('PBData', f"[ws] enqueue debounce failed for positions {user.name}: {e}", level='ERROR')
-                    # Debug: optionally log the positions payload
-                    # Debug: optionally log the positions payload
-                    try:
-                        if is_debug_enabled('PBData'):
-                            preview = repr(_)
-                            if len(preview) > 300:
-                                preview = preview[:300] + '...'
-                            _human_log('PBData', f"[ws] watch_positions payload for {user.name}: type={type(_)} preview={preview}", level='DEBUG')
-                    except Exception:
-                        if is_debug_enabled('PBData'):
-                            try:
-                                _human_log('PBData', f"[ws] watch_positions payload for {user.name}: (unrepresentable)", level='DEBUG')
-                            except Exception:
-                                pass
-                except Exception as e:
-                    raw = str(e)
-                    lower = raw.lower()
-                    # treat normal websocket close (1000) as a reconnect opportunity
-                    if self._is_normal_ws_close(raw):
-                        self._throttled_log_network((user.exchange, user.name), f"[ws] normal websocket close (positions) for {user.name}: {e}; attempting reconnect", self._network_error_log_throttle)
-                        try:
-                            ex2 = await self.request_private_client(user.exchange, user, caller='PBData._position_ws_loop')
-                            if not ex2:
-                                _human_log('PBData', f"[ws] Could not re-acquire private client for {user.name} (positions); falling back to REST", level='WARNING')
-                                try:
-                                    await Exchange.close_private_ws_client(user.exchange, user)
-                                except Exception:
-                                    pass
-                                return
-                            await asyncio.sleep(1)
-                            continue
-                        except Exception:
-                            try:
-                                await Exchange.close_private_ws_client(user.exchange, user)
-                            except Exception:
-                                pass
-                            return
-                    if 'cannot track more than' in lower or ('cannot track' in lower and 'user' in lower):
-                        _human_log('PBData', f"[ws] watch_positions user-limit reached for {user.name}: {e}; closing private ws client and falling back to REST", level='WARNING')
-                        try:
-                            await Exchange.close_private_ws_client(user.exchange, user)
-                        except Exception:
-                            pass
-                        return
-                    # Detect keepalive/ping-pong style timeouts and attempt single restart before demotion
-                    try:
-                        key = (user.exchange, user.name)
-                        try:
-                            self._ws_success_counts[key] = 0
-                        except Exception:
-                            pass
-                        keepalive_triggers = ['ping-pong', 'pingpong', 'keepalive', 'requesttimeout']
-                        if any(k in lower for k in keepalive_triggers) or ('timed out' in lower and 'ping' in lower):
-                            if key not in self._ws_restarted_once:
-                                # Claim the restart slot *before* the first await so no other
-                                # concurrent loop for this user can also enter the restart path.
-                                self._ws_restarted_once.add(key)
-                                _human_log('PBData', f"[ws] Keepalive timeout detected (positions); restarting private ws client for {user.name} ({user.exchange})", level='WARNING')
-                                try:
-                                    await Exchange.close_private_ws_client(user.exchange, user)
-                                except Exception:
-                                    pass
-                                async with self._get_reconnect_sem(user.exchange):
-                                    await asyncio.sleep(self._ws_restart_sleep + random.random() * 0.5)
-                                    try:
-                                        ex2 = await self.request_private_client(user.exchange, user, caller='PBData._position_ws_loop')
-                                        if ex2:
-                                            ex = ex2
-                                            _human_log('PBData', f"[ws] Restarted private ws client for {user.name} ({user.exchange}); will not restart again until {self._ws_success_required} successful messages", level='INFO')
-                                            continue
-                                    except Exception:
-                                        pass
-                            # else: fall through to normal handling
-                    except Exception:
-                        pass
-                    # Network-level failures should cause this user to fall back to REST
-                    network_triggers = ['connection closed', 'networkerror', 'connection reset', 'remote server', 'eof', 'connection aborted', 'broken pipe']
-                    if any(k in lower for k in network_triggers) or isinstance(e, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
-                        _human_log('PBData', f"[ws] watch_positions network error for {user.name}: {e}; considering demotion to REST", level='WARNING')
-                        exch_key = user.exchange
-                        lock = self._network_error_locks.get(exch_key)
-                        if lock is None:
-                            lock = asyncio.Lock()
-                            self._network_error_locks[exch_key] = lock
-                        async with lock:
-                            now_ts = datetime.now().timestamp()
-                            existing = self._exchange_network_error_users.get(exch_key, {})
-                            stale = [uname for uname, ts in existing.items() if now_ts - ts > self._network_demotion_window]
-                            for s in stale:
-                                existing.pop(s, None)
-                            if not existing:
-                                existing[user.name] = now_ts
-                                self._exchange_network_error_users[exch_key] = existing
-                                _human_log('PBData', f"[ws] Demoting {user.name} to REST for exchange {exch_key} (first in window)", level='WARNING')
-                                try:
-                                    await Exchange.close_private_ws_client(user.exchange, user)
-                                except Exception:
-                                    pass
-                                return
-                            else:
-                                _human_log('PBData', f"[ws] Recent demotion exists for exchange {exch_key}; attempting to keep {user.name} on websocket", level='INFO')
-                                try:
-                                    ex2 = await self.request_private_client(user.exchange, user, caller='PBData._position_ws_loop')
-                                    if not ex2:
-                                        _human_log('PBData', f"[ws] Could not re-acquire private client for {user.name}; falling back to REST", level='WARNING', user=user)
-                                        try:
-                                            await Exchange.close_private_ws_client(user.exchange, user)
-                                        except Exception:
-                                            pass
-                                        return
-                                    await asyncio.sleep(1)
-                                    continue
-                                except Exception:
-                                    try:
-                                        await Exchange.close_private_ws_client(user.exchange, user)
-                                    except Exception:
-                                        pass
-                                    return
-                    _human_log('PBData', f"[ws] watch_positions error for {user.name}: {e}", level='ERROR', user=user)
-                    # Add jittered backoff to avoid synchronized reconnect storms
-                    await asyncio.sleep(1 + random.random() * 4)
-        finally:
-            # Intentionally not closing `ex` here. Keep shared websocket clients
-            # open so other watchers are not interrupted.
-            try:
-                _human_log('PBData', f"Leaving ws client open in _position_ws_loop for {user.name} ({exch.id})", level='DEBUG')
-            except Exception:
-                pass
-
-    async def _order_ws_loop(self, user):
-        from Exchange import Exchange
-        await asyncio.sleep((hash(user.name) % 5000) / 1000.0)
-        exch = Exchange(user.exchange, user)
-        ex = await self.request_private_client(user.exchange, user, caller='PBData._order_ws_loop')
-        if not ex:
-            _human_log('PBData', f"[ws] ccxtpro unavailable or unsupported (orders) for {user.name} ({user.exchange}); relying on shared orders poller", level='DEBUG')
-            return
-        supports_orders = False
-        try:
-            if hasattr(ex, 'has'):
-                if isinstance(ex.has, dict):
-                    supports_orders = ex.has.get('watchOrders', False)
-                else:
-                    supports_orders = getattr(ex.has, 'watchOrders', False)
-        except Exception:
-            supports_orders = False
-        if not supports_orders:
-            key = (user.name, exch.id)
-            if key not in self._watch_positions_not_supported_logged:
-                _human_log('PBData', f"[ws] watch_orders not supported for {user.name} ({exch.id}); relying on shared orders poller", level='INFO')
-                self._watch_positions_not_supported_logged.add(key)
-            return
-        _human_log('PBData', f"[ws] Starting orders watcher for {user.name} ({exch.id})", level='INFO')
-        # Throttle REST order updates so we don't hammer the exchange when
-        # websockets produce many events in a short time.
-        min_orders_refresh_interval = 20
-        last_orders_refresh = 0
-        _last_settings_reload = 0.0
-        try:
-            while True:
-                # Reload settings at most every 30s
-                _now = datetime.now().timestamp()
-                if _now - _last_settings_reload >= 30.0:
-                    try:
-                        self._load_settings()
-                    except Exception:
-                        pass
-                    _last_settings_reload = _now
-                try:
-                    orders = await ex.watch_orders()
-                    # Successful watch_orders: increment success counter and clear restart marker after threshold
-                    try:
-                        key = (user.exchange, user.name)
-                        self._ws_success_counts[key] = self._ws_success_counts.get(key, 0) + 1
-                        if self._ws_success_counts.get(key, 0) >= self._ws_success_required:
-                            if key in self._ws_restarted_once:
-                                self._ws_restarted_once.discard(key)
-                                _human_log('PBData', f"[ws] Restart state cleared for {user.name} ({user.exchange}) after {self._ws_success_required} successful watch events", level='INFO', user=user)
-                            self._ws_success_counts[key] = 0
-                    except Exception:
-                        pass
-                    # On orders updates, persist orders but no more often than
-                    # min_orders_refresh_interval seconds to avoid excessive
-                    # REST calls when many users or frequent WS updates.
-                    # Debug: optionally log the orders payload
-                    try:
-                        if is_debug_enabled('PBData'):
-                            preview = repr(orders)
-                            if len(preview) > 300:
-                                preview = preview[:300] + '...'
-                            _human_log('PBData', f"[ws] watch_orders payload for {user.name}: type={type(orders)} preview={preview}", level='DEBUG')
-                    except Exception:
-                        if is_debug_enabled('PBData'):
-                            try:
-                                _human_log('PBData', f"[ws] watch_orders payload for {user.name}: (unrepresentable)", level='DEBUG')
-                            except Exception:
-                                pass
-                    now_sec = int(datetime.now().timestamp())
-                    if now_sec - last_orders_refresh >= min_orders_refresh_interval:
-                        last_orders_refresh = now_sec
-                        try:
-                            await self._enqueue_debounce('orders', user)
-                        except Exception as e:
-                            _human_log('PBData', f"[ws->REST] enqueue debounce failed for orders {user.name}: {e}")
-                except Exception as e:
-                    raw = str(e)
-                    lower = raw.lower()
-                    # treat normal websocket close (1000) as a reconnect opportunity
-                    if self._is_normal_ws_close(raw):
-                        self._throttled_log_network((user.exchange, user.name), f"[ws] normal websocket close (orders) for {user.name}: {e}; attempting reconnect", self._network_error_log_throttle)
-                        try:
-                            ex2 = await self.request_private_client(user.exchange, user, caller='PBData._order_ws_loop')
-                            if not ex2:
-                                _human_log('PBData', f"[ws] Could not re-acquire private client for {user.name} (orders); falling back to REST", level='WARNING')
-                                try:
-                                    await Exchange.close_private_ws_client(user.exchange, user)
-                                except Exception:
-                                    pass
-                                return
-                            await asyncio.sleep(1)
-                            continue
-                        except Exception:
-                            try:
-                                await Exchange.close_private_ws_client(user.exchange, user)
-                            except Exception:
-                                pass
-                            return
-                    # existing network error handling follows
-                    if 'cannot track more than' in lower or ('cannot track' in lower and 'user' in lower):
-                        _human_log('PBData', f"[ws] watch_orders user-limit reached for {user.name}: {e}; closing private ws client and falling back to REST", level='WARNING')
-                        try:
-                            await Exchange.close_private_ws_client(user.exchange, user)
-                        except Exception:
-                            pass
-                        return
-                    # Detect keepalive/ping-pong style timeouts and attempt a single restart before demotion
-                    try:
-                        key = (user.exchange, user.name)
-                        try:
-                            self._ws_success_counts[key] = 0
-                        except Exception:
-                            pass
-                        keepalive_triggers = ['ping-pong', 'pingpong', 'keepalive', 'requesttimeout']
-                        if any(k in lower for k in keepalive_triggers) or ('timed out' in lower and 'ping' in lower):
-                            if key not in self._ws_restarted_once:
-                                # Claim the restart slot *before* the first await so no other
-                                # concurrent loop for this user can also enter the restart path.
-                                self._ws_restarted_once.add(key)
-                                _human_log('PBData', f"[ws] Keepalive timeout detected (orders); restarting private ws client for {user.name} ({user.exchange})", level='WARNING')
-                                try:
-                                    await Exchange.close_private_ws_client(user.exchange, user)
-                                except Exception:
-                                    pass
-                                async with self._get_reconnect_sem(user.exchange):
-                                    await asyncio.sleep(self._ws_restart_sleep + random.random() * 0.5)
-                                    try:
-                                        ex2 = await self.request_private_client(user.exchange, user, caller='PBData._order_ws_loop')
-                                        if ex2:
-                                            ex = ex2
-                                            _human_log('PBData', f"[ws] Restarted private ws client for {user.name} ({user.exchange}); will not restart again until {self._ws_success_required} successful messages", level='INFO')
-                                            continue
-                                    except Exception:
-                                        pass
-                            # else: fall through to normal handling
-                    except Exception:
-                        pass
-                    # Network-level failures should cause this user to fall back to REST
-                    network_triggers = ['connection closed', 'networkerror', 'connection reset', 'remote server', 'eof', 'connection aborted', 'broken pipe']
-                    if any(k in lower for k in network_triggers) or isinstance(e, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
-                        _human_log('PBData', f"[ws] watch_orders network error for {user.name}: {e}; considering demotion to REST", level='WARNING')
-                        exch_key = user.exchange
-                        lock = self._network_error_locks.get(exch_key)
-                        if lock is None:
-                            lock = asyncio.Lock()
-                            self._network_error_locks[exch_key] = lock
-                        async with lock:
-                            now_ts = datetime.now().timestamp()
-                            existing = self._exchange_network_error_users.get(exch_key, {})
-                            stale = [uname for uname, ts in existing.items() if now_ts - ts > self._network_demotion_window]
-                            for s in stale:
-                                existing.pop(s, None)
-                            if not existing:
-                                existing[user.name] = now_ts
-                                self._exchange_network_error_users[exch_key] = existing
-                                _human_log('PBData', f"[ws] Demoting {user.name} to REST for exchange {exch_key} (first in window)")
-                                try:
-                                    await Exchange.close_private_ws_client(user.exchange, user)
-                                except Exception:
-                                    pass
-                                return
-                            else:
-                                _human_log('PBData', f"[ws] Recent demotion exists for exchange {exch_key}; attempting to keep {user.name} on websocket")
-                                try:
-                                    ex2 = await self.request_private_client(user.exchange, user, caller='PBData._order_ws_loop')
-                                    if not ex2:
-                                        _human_log('PBData', f"[ws] Could not re-acquire private client for {user.name}; falling back to REST")
-                                        try:
-                                            await Exchange.close_private_ws_client(user.exchange, user)
-                                        except Exception:
-                                            pass
-                                        return
-                                    await asyncio.sleep(1)
-                                    continue
-                                except Exception:
-                                    try:
-                                        await Exchange.close_private_ws_client(user.exchange, user)
-                                    except Exception:
-                                        pass
-                                    return
-                    raw_msg = str(e)
-                    exc_type = type(e).__name__
-                    _human_log('PBData', f"[ws] watch_orders error for {user.name}: {raw_msg} (type={exc_type})", level='ERROR', user=user)
-                    # Add jittered backoff to avoid synchronized reconnect storms
-                    await asyncio.sleep(1 + random.random() * 4)
-        finally:
-            # Intentionally not closing `ex` here. Keep shared websocket clients
-            # open so other watchers are not interrupted.
-            try:
-                _human_log('PBData', f"Leaving ws client open in _order_ws_loop for {user.name} ({exch.id})", level='DEBUG')
-            except Exception:
-                pass
-
     async def _order_poll_loop(self, user, interval_seconds: int = 5):
         _human_log('PBData', f"[poll] Starting orders poller for {user.name}", level='INFO', user=user)
         while True:
@@ -3000,301 +2421,48 @@ class PBData():
             else:
                 batches = [(None, users)]
             had_rate_limit = False
+            _serial_cycle_start = datetime.now().timestamp()
+            _serial_users_polled = 0
             for exch, batch_users in batches:
-                # Skip this exchange while in backoff
-                if exch and self._is_exchange_in_backoff(exch):
+                # Skip this exchange while in backoff (not for budget-tracked exchanges).
+                # For kind='history', also check history-specific backoff (long_history_poll).
+                _has_budget_ex = exch and exch in self._rate_budgets
+                in_backoff = exch and not _has_budget_ex and self._is_exchange_in_backoff(exch)
+                if not in_backoff and not _has_budget_ex and kind == 'history':
+                    in_backoff = exch and self._is_exchange_in_history_backoff(exch)
+                if in_backoff:
                     _human_log('PBData', f"[poll] Skipping shared {kind} poll for {exch} due to backoff", level='INFO')
                     continue
-                for user in batch_users:
-                    try:
-                        if kind == 'positions':
-                            # If a per-user active websocket positions watcher exists,
-                            # let the WS task drive position updates — skip REST here
-                            # to avoid duplicate parallel requests that can trigger rate limits.
-                            ws_task = self._position_ws_tasks.get(user.name)
-                            if ws_task and not ws_task.done():
-                                # WS active for this user; skip shared REST update
-                                # (WS will call db.update_positions on events).
-                                # Log occasionally for visibility.
-                                last_log = getattr(self, '_last_skipped_position_log', 0)
-                                now_ts = datetime.now().timestamp()
-                                if now_ts - last_log > 300:
-                                    _human_log('PBData', f"[poll] Skipping shared positions update for {user.name} because WS watcher active", level='INFO', user=user)
-                                    self._last_skipped_position_log = now_ts
-                                continue
-                            # Gate shared REST calls using per-exchange REST slot
-                            exchange_for_slot = exch or user.exchange
-                            try:
-                                async with self._rest_slot(exchange_for_slot) as got:
-                                    if got:
-                                        await asyncio.to_thread(self.db.update_positions, user)
-                                        try:
-                                            self._last_fetch_ts[(user.name, 'positions')] = datetime.now().timestamp()
-                                        except Exception:
-                                            pass
-                                    else:
-                                        # Could not acquire REST slot; skip this update
-                                        try:
-                                            _human_log('PBData', f"[poll] Skipped positions update for {user.name}; rest slot busy for {exchange_for_slot}", level=self._rest_slot_busy_log_level)
-                                        except Exception:
-                                            pass
-                                        had_rate_limit = True
-                            except Exception as e:
-                                # Handle InvalidNonce specially to avoid generator issues and retry storms
+                # Acquire per-exchange budget lock so pollers don't starve each other.
+                _bpl2 = self._budget_poller_locks.get(exch)
+                if _bpl2:
+                    await _bpl2.acquire()
+                try:
+                    for user in batch_users:
+                        try:
+                            if kind == 'positions':
+                                # Gate shared REST calls using per-exchange REST slot
+                                exchange_for_slot = exch or user.exchange
                                 try:
-                                    msg = str(e).lower()
-                                    if 'invalid request' in msg and 'recv_window' in msg:
-                                        tb = traceback.format_exc()
-                                        try:
-                                            parsed = self._parse_recv_window_from_exception(e)
-                                        except Exception:
-                                            parsed = {}
-                                        try:
-                                            meta = {'traceback': tb} if tb else {}
-                                            if parsed:
-                                                meta.update(parsed)
-                                            if not meta:
-                                                meta = None
-                                            _human_log('PBData', f"[poll] InvalidNonce / recv_window error for {user.name} ({user.exchange}): {e}", level='WARNING', meta=meta)
-                                        except Exception:
-                                            pass
-                                        try:
-                                            dur = None
-                                            if parsed and parsed.get('delta_ms') is not None:
-                                                delta_s = int(abs(int(parsed.get('delta_ms'))) / 1000)
-                                                dur = min(max(60, delta_s + 10), 600)
-                                            self._set_exchange_backoff(user.exchange, reason='invalid_nonce', duration=dur or 60, user=user)
-                                        except Exception:
-                                            pass
-                                        had_rate_limit = True
-                                        continue
-                                except Exception:
-                                    pass
-                        elif kind == 'orders':
-                            # Skip shared orders poll if user has active WS orders watcher
-                            ws_task = self._order_ws_tasks.get(user.name)
-                            if ws_task and not ws_task.done():
-                                last_log = getattr(self, '_last_skipped_order_log', 0)
-                                now_ts = datetime.now().timestamp()
-                                if now_ts - last_log > 300:
-                                    _human_log('PBData', f"[poll] Skipping shared orders update for {user.name} because WS watcher active")
-                                    self._last_skipped_order_log = now_ts
-                                continue
-                            exchange_for_slot = exch or user.exchange
-                            try:
-                                async with self._rest_slot(exchange_for_slot) as got:
-                                    if got:
-                                        await asyncio.to_thread(self.db.update_orders, user)
-                                        try:
-                                            self._last_fetch_ts[(user.name, 'orders')] = datetime.now().timestamp()
-                                        except Exception:
-                                            pass
-                                    else:
-                                        try:
-                                            _human_log('PBData', f"[poll] Skipped orders update for {user.name}; rest slot busy for {exchange_for_slot}", level=self._rest_slot_busy_log_level)
-                                        except Exception:
-                                            pass
-                                        had_rate_limit = True
-                            except Exception as e:
-                                try:
-                                    msg = str(e).lower()
-                                    if 'invalid request' in msg and 'recv_window' in msg:
-                                        tb = traceback.format_exc()
-                                        try:
-                                            parsed = self._parse_recv_window_from_exception(e)
-                                        except Exception:
-                                            parsed = {}
-                                        try:
-                                            meta = {'traceback': tb} if tb else {}
-                                            if parsed:
-                                                meta.update(parsed)
-                                            if not meta:
-                                                meta = None
-                                            _human_log('PBData', f"[poll] InvalidNonce / recv_window error for {user.name} ({user.exchange}): {e}", level='WARNING', meta=meta)
-                                        except Exception:
-                                            pass
-                                        try:
-                                            dur = None
-                                            if parsed and parsed.get('delta_ms') is not None:
-                                                delta_s = int(abs(int(parsed.get('delta_ms'))) / 1000)
-                                                dur = min(max(60, delta_s + 10), 600)
-                                            self._set_exchange_backoff(user.exchange, reason='invalid_nonce', duration=dur or 60, user=user)
-                                        except Exception:
-                                            pass
-                                        had_rate_limit = True
-                                        continue
-                                except Exception:
-                                    pass
-                        elif kind == 'history':
-                            # Instrument shared history polling for debugging/tracing
-                            key = (user.name, user.exchange)
-                            start_ts = datetime.now().timestamp()
-                            _human_log('PBData', f"[poll] Shared history poll START for {user.name} ({user.exchange})", level='INFO', user=user)
-                            # Time the history update; if it is very long, mark exchange backoff
-                            exchange_for_slot = exch or user.exchange
-                            try:
-                                async with self._rest_slot(exchange_for_slot) as got:
-                                    if not got:
-                                        try:
-                                            _human_log('PBData', f"[poll] Skipped history update for {user.name}; rest slot busy for {exchange_for_slot}", level=self._rest_slot_busy_log_level)
-                                        except Exception:
-                                            pass
-                                        had_rate_limit = True
-                                    else:
-                                        try:
-                                            await asyncio.to_thread(self.db.update_history, user)
-                                            asyncio.create_task(_notify_api_income(getattr(user, 'name', '')))
-                                        except Exception as e:
-                                            # Some runtime errors seen under heavy load look like
-                                            # "generator didn't stop after athrow()". Treat these
-                                            # as transient and escalate to backoff while logging.
-                                            msg = str(e)
-                                            lower = msg.lower()
-                                            if 'invalid request' in lower and 'recv_window' in lower:
-                                                tb = traceback.format_exc()
-                                                try:
-                                                    parsed = self._parse_recv_window_from_exception(e)
-                                                except Exception:
-                                                    parsed = {}
-                                                try:
-                                                    meta = {'traceback': tb} if tb else {}
-                                                    if parsed:
-                                                        meta.update(parsed)
-                                                    if not meta:
-                                                        meta = None
-                                                    _human_log('PBData', f"[poll] InvalidNonce / recv_window error for {user.name} ({user.exchange}): {e}", level='WARNING', meta=meta)
-                                                except Exception:
-                                                    pass
-                                                try:
-                                                    dur = None
-                                                    if parsed and parsed.get('delta_ms') is not None:
-                                                        delta_s = int(abs(int(parsed.get('delta_ms'))) / 1000)
-                                                        dur = min(max(60, delta_s + 10), 600)
-                                                    self._set_exchange_backoff(user.exchange, reason='invalid_nonce', duration=dur or 60, user=user)
-                                                except Exception:
-                                                    pass
-                                                had_rate_limit = True
-                                            elif 'generator didn\'t stop after athrow' in msg or 'athrow' in lower:
-                                                try:
-                                                    _human_log('PBData', f"[poll] history update failed for {user.name}: {msg}", level='ERROR')
-                                                except Exception:
-                                                    pass
-                                                had_rate_limit = True
-                                            else:
-                                                # Re-raise unexpected exceptions to be handled by outer handler
-                                                raise
-                            except Exception as e:
-                                raise
-                            dur_ms = int((datetime.now().timestamp() - start_ts) * 1000)
-                            if dur_ms / 1000.0 > self._long_poll_threshold_seconds:
-                                # mark exchange as overloaded and backoff longer (include user for logging)
-                                try:
-                                    self._set_exchange_backoff(user.exchange, reason='long_history_poll', duration=self._backoff_duration_seconds * 2, user=user)
-                                except Exception:
-                                    pass
-                            # record last successful REST history poll time per user/exchange
-                            try:
-                                self._history_rest_last[key] = start_ts
-                                try:
-                                    self._last_fetch_ts[(user.name, 'history')] = start_ts
-                                except Exception:
-                                    pass
-                            except Exception:
-                                pass
-                            try:
-                                self._write_fetch_summary()
-                            except Exception:
-                                pass
-                            _human_log('PBData', f"[poll] Shared history poll DONE for {user.name} ({user.exchange}) dur={dur_ms}ms", level='INFO', user=user)
-                        elif kind == 'executions':
-                            # Re-check allowed executions users before each fetch so that
-                            # removing a user in the UI takes effect immediately even
-                            # mid-cycle.
-                            try:
-                                self.load_trades_users()
-                                if user.name not in (self.trades_users or []):
-                                    continue
-                            except Exception:
-                                # Fail-safe: if we cannot determine the allow-list, skip.
-                                continue
-                            start_ts = datetime.now().timestamp()
-                            exchange_for_slot = exch or user.exchange
-                            did_run = False
-                            fetched = None
-                            inserted = None
-                            try:
-                                async with self._rest_slot(exchange_for_slot) as got:
-                                    if not got:
-                                        try:
-                                            _human_log('PBData', f"[poll] Skipped executions update for {user.name}; rest slot busy for {exchange_for_slot}", level=self._rest_slot_busy_log_level)
-                                        except Exception:
-                                            pass
-                                        had_rate_limit = True
-                                    else:
-                                        did_run = True
-                                        res = await asyncio.to_thread(self.db.update_executions, user)
-                                        try:
-                                            if isinstance(res, dict):
-                                                fetched = res.get('fetched')
-                                                inserted = res.get('inserted')
-                                        except Exception:
-                                            pass
-                                        try:
-                                            self._last_fetch_ts[(user.name, 'executions')] = start_ts
-                                        except Exception:
-                                            pass
-                                try:
-                                    self._write_fetch_summary()
-                                except Exception:
-                                    pass
-                            except Exception:
-                                # Let outer handler log traceback + handle rate-limit keywords.
-                                raise
-                            if did_run:
-                                try:
-                                    dur_ms = int((datetime.now().timestamp() - start_ts) * 1000)
-                                    _human_log(
-                                        'PBData',
-                                        f"[poll] Shared executions poll DONE for {user.name} ({user.exchange}) dur={dur_ms}ms fetched={fetched} inserted={inserted}",
-                                        level='INFO',
-                                        user=user,
-                                    )
-                                except Exception:
-                                    pass
-                        elif kind == 'balances':
-                            # Skip shared balances poll if user has active WS balances watcher
-                            ws_task = self._balance_ws_tasks.get(user.name)
-                            if ws_task and not ws_task.done():
-                                last_log = getattr(self, '_last_skipped_balance_log', 0)
-                                now_ts = datetime.now().timestamp()
-                                if now_ts - last_log > 300:
-                                    _human_log('PBData', f"[poll] Skipping shared balances update for {user.name} because WS watcher active")
-                                    self._last_skipped_balance_log = now_ts
-                                continue
-                            exchange_for_slot = exch or user.exchange
-                            try:
-                                async with self._rest_slot(exchange_for_slot) as got:
-                                    if got:
-                                        await asyncio.to_thread(self.db.update_balances, user)
-                                        asyncio.create_task(_notify_api_balance())
-                                        try:
-                                            self._last_fetch_ts[(user.name, 'balances')] = datetime.now().timestamp()
-                                        except Exception:
-                                            pass
-                                        try:
-                                            self._write_fetch_summary()
-                                        except Exception:
-                                            pass
-                                    else:
-                                        try:
-                                            _human_log('PBData', f"[poll] Skipped balances update for {user.name}; rest slot busy for {exchange_for_slot}", level=self._rest_slot_busy_log_level)
-                                        except Exception:
-                                            pass
-                                        had_rate_limit = True
-                            except Exception as e:
-                                try:
-                                    msg = str(e).lower()
-                                    if 'invalid request' in msg and 'recv_window' in msg:
+                                    async with self._rest_slot(exchange_for_slot) as got:
+                                        if got:
+                                            await asyncio.to_thread(self.db.update_positions, user)
+                                            try:
+                                                self._last_fetch_ts[(user.name, 'positions')] = datetime.now().timestamp()
+                                            except Exception:
+                                                pass
+                                        else:
+                                            # Could not acquire REST slot; skip this update
+                                            try:
+                                                _human_log('PBData', f"[poll] Skipped positions update for {user.name}; rest slot busy for {exchange_for_slot}", level=self._rest_slot_busy_log_level)
+                                            except Exception:
+                                                pass
+                                            had_rate_limit = True
+                                except Exception as e:
+                                    # Handle InvalidNonce specially to avoid generator issues and retry storms
+                                    try:
+                                        msg = str(e).lower()
+                                        if 'invalid request' in msg and 'recv_window' in msg:
                                             tb = traceback.format_exc()
                                             try:
                                                 parsed = self._parse_recv_window_from_exception(e)
@@ -3319,49 +2487,340 @@ class PBData():
                                                 pass
                                             had_rate_limit = True
                                             continue
+                                    except Exception:
+                                        pass
+                            elif kind == 'orders':
+                                exchange_for_slot = exch or user.exchange
+                                try:
+                                    async with self._rest_slot(exchange_for_slot) as got:
+                                        if got:
+                                            await asyncio.to_thread(self.db.update_orders, user)
+                                            try:
+                                                self._last_fetch_ts[(user.name, 'orders')] = datetime.now().timestamp()
+                                            except Exception:
+                                                pass
+                                        else:
+                                            try:
+                                                _human_log('PBData', f"[poll] Skipped orders update for {user.name}; rest slot busy for {exchange_for_slot}", level=self._rest_slot_busy_log_level)
+                                            except Exception:
+                                                pass
+                                            had_rate_limit = True
+                                except Exception as e:
+                                    try:
+                                        msg = str(e).lower()
+                                        if 'invalid request' in msg and 'recv_window' in msg:
+                                            tb = traceback.format_exc()
+                                            try:
+                                                parsed = self._parse_recv_window_from_exception(e)
+                                            except Exception:
+                                                parsed = {}
+                                            try:
+                                                meta = {'traceback': tb} if tb else {}
+                                                if parsed:
+                                                    meta.update(parsed)
+                                                if not meta:
+                                                    meta = None
+                                                _human_log('PBData', f"[poll] InvalidNonce / recv_window error for {user.name} ({user.exchange}): {e}", level='WARNING', meta=meta)
+                                            except Exception:
+                                                pass
+                                            try:
+                                                dur = None
+                                                if parsed and parsed.get('delta_ms') is not None:
+                                                    delta_s = int(abs(int(parsed.get('delta_ms'))) / 1000)
+                                                    dur = min(max(60, delta_s + 10), 600)
+                                                self._set_exchange_backoff(user.exchange, reason='invalid_nonce', duration=dur or 60, user=user)
+                                            except Exception:
+                                                pass
+                                            had_rate_limit = True
+                                            continue
+                                    except Exception:
+                                        pass
+                            elif kind == 'history':
+                                # Instrument shared history polling for debugging/tracing
+                                key = (user.name, user.exchange)
+                                start_ts = datetime.now().timestamp()
+                                _human_log('PBData', f"[poll] Shared history poll START for {user.name} ({user.exchange})", level='INFO', user=user)
+                                # Time the history update; if it is very long, mark exchange backoff
+                                exchange_for_slot = exch or user.exchange
+                                try:
+                                    async with self._rest_slot(exchange_for_slot) as got:
+                                        if not got:
+                                            try:
+                                                _human_log('PBData', f"[poll] Skipped history update for {user.name}; rest slot busy for {exchange_for_slot}", level=self._rest_slot_busy_log_level)
+                                            except Exception:
+                                                pass
+                                            had_rate_limit = True
+                                        else:
+                                            # Acquire rate budget before history fetch
+                                            _budget_ok = await self._acquire_rate_budget(exchange_for_slot, 'fetch_history')
+                                            if not _budget_ok:
+                                                pass  # budget timeout — skip but don't set backoff
+                                            try:
+                                                if _budget_ok:
+                                                    await asyncio.to_thread(self.db.update_history, user)
+                                                    asyncio.create_task(_notify_api_income(getattr(user, 'name', '')))
+                                                    # Mark balance + positions + orders as stale so the next combined
+                                                    # cycle refreshes them (fills/funding change both).
+                                                    try:
+                                                        self._balance_stale_users.add(user.name)
+                                                        self._positions_stale_users.add(user.name)
+                                                        self._orders_stale_users.add(user.name)
+                                                    except Exception:
+                                                        pass
+                                            except Exception as e:
+                                                # Some runtime errors seen under heavy load look like
+                                                # "generator didn't stop after athrow()". Treat these
+                                                # as transient and escalate to backoff while logging.
+                                                msg = str(e)
+                                                lower = msg.lower()
+                                                if 'invalid request' in lower and 'recv_window' in lower:
+                                                    tb = traceback.format_exc()
+                                                    try:
+                                                        parsed = self._parse_recv_window_from_exception(e)
+                                                    except Exception:
+                                                        parsed = {}
+                                                    try:
+                                                        meta = {'traceback': tb} if tb else {}
+                                                        if parsed:
+                                                            meta.update(parsed)
+                                                        if not meta:
+                                                            meta = None
+                                                        _human_log('PBData', f"[poll] InvalidNonce / recv_window error for {user.name} ({user.exchange}): {e}", level='WARNING', meta=meta)
+                                                    except Exception:
+                                                        pass
+                                                    try:
+                                                        dur = None
+                                                        if parsed and parsed.get('delta_ms') is not None:
+                                                            delta_s = int(abs(int(parsed.get('delta_ms'))) / 1000)
+                                                            dur = min(max(60, delta_s + 10), 600)
+                                                        self._set_exchange_backoff(user.exchange, reason='invalid_nonce', duration=dur or 60, user=user)
+                                                    except Exception:
+                                                        pass
+                                                    had_rate_limit = True
+                                                elif 'generator didn\'t stop after athrow' in msg or 'athrow' in lower:
+                                                    try:
+                                                        _human_log('PBData', f"[poll] history update failed for {user.name}: {msg}", level='ERROR')
+                                                    except Exception:
+                                                        pass
+                                                    had_rate_limit = True
+                                                else:
+                                                    # Re-raise unexpected exceptions to be handled by outer handler
+                                                    raise
+                                except Exception as e:
+                                    raise
+                                dur_ms = int((datetime.now().timestamp() - start_ts) * 1000)
+                                if dur_ms / 1000.0 > self._long_poll_threshold_seconds:
+                                    # mark exchange as overloaded and backoff longer (include user for logging)
+                                    try:
+                                        self._set_exchange_backoff(user.exchange, reason='long_history_poll', duration=self._backoff_duration_seconds * 2, user=user)
+                                    except Exception:
+                                        pass
+                                # record last successful REST history poll time per user/exchange
+                                try:
+                                    self._history_rest_last[key] = start_ts
+                                    try:
+                                        self._last_fetch_ts[(user.name, 'history')] = start_ts
+                                    except Exception:
+                                        pass
                                 except Exception:
                                     pass
-                        # (duplicate branches removed)
-                    except Exception as e:
-                        msg = str(e)
-                        tb = traceback.format_exc()
-                        try:
-                            _human_log('PBData', f"[poll] Shared {kind} poll failed for {user.name}: {e}", level='ERROR', meta={'traceback': tb})
-                        except Exception:
-                            pass
-                        lower = msg.lower()
-                        if '429' in lower or 'too many requests' in lower or 'rate limit' in lower:
-                            had_rate_limit = True
-                    # Small stagger between per-user REST requests to avoid bursts
-                    try:
-                        pause_val = self._shared_rest_pause_by_exchange.get(exch, self._shared_rest_user_pause)
-                        if pause_val and pause_val > 0:
-                            jitter = random.uniform(0, pause_val * 0.2)
-                            await asyncio.sleep(pause_val + jitter)
-                    except Exception:
-                        pass
+                                try:
+                                    self._write_fetch_summary()
+                                except Exception:
+                                    pass
+                                _human_log('PBData', f"[poll] Shared history poll DONE for {user.name} ({user.exchange}) dur={dur_ms}ms", level='INFO', user=user)
+                            elif kind == 'executions':
+                                # Re-check allowed executions users before each fetch so that
+                                # removing a user in the UI takes effect immediately even
+                                # mid-cycle.
+                                try:
+                                    self.load_trades_users()
+                                    if user.name not in (self.trades_users or []):
+                                        continue
+                                except Exception:
+                                    # Fail-safe: if we cannot determine the allow-list, skip.
+                                    continue
+                                start_ts = datetime.now().timestamp()
+                                exchange_for_slot = exch or user.exchange
+                                did_run = False
+                                fetched = None
+                                inserted = None
+                                try:
+                                    async with self._rest_slot(exchange_for_slot) as got:
+                                        if not got:
+                                            try:
+                                                _human_log('PBData', f"[poll] Skipped executions update for {user.name}; rest slot busy for {exchange_for_slot}", level=self._rest_slot_busy_log_level)
+                                            except Exception:
+                                                pass
+                                            had_rate_limit = True
+                                        else:
+                                            _exec_budget_ok = await self._acquire_rate_budget(exchange_for_slot, 'fetch_executions')
+                                            if _exec_budget_ok:
+                                                did_run = True
+                                                res = await asyncio.to_thread(self.db.update_executions, user)
+                                                try:
+                                                    if isinstance(res, dict):
+                                                        fetched = res.get('fetched')
+                                                        inserted = res.get('inserted')
+                                                        if inserted and inserted > 0:
+                                                            self._balance_stale_users.add(user.name)
+                                                            self._positions_stale_users.add(user.name)
+                                                            self._orders_stale_users.add(user.name)
+                                                except Exception:
+                                                    pass
+                                                try:
+                                                    self._last_fetch_ts[(user.name, 'executions')] = start_ts
+                                                except Exception:
+                                                    pass
+                                    try:
+                                        self._write_fetch_summary()
+                                    except Exception:
+                                        pass
+                                except Exception:
+                                    # Let outer handler log traceback + handle rate-limit keywords.
+                                    raise
+                                if did_run:
+                                    try:
+                                        dur_ms = int((datetime.now().timestamp() - start_ts) * 1000)
+                                        _human_log(
+                                            'PBData',
+                                            f"[poll] Shared executions poll DONE for {user.name} ({user.exchange}) dur={dur_ms}ms fetched={fetched} inserted={inserted}",
+                                            level='INFO',
+                                            user=user,
+                                        )
+                                    except Exception:
+                                        pass
+                            elif kind == 'balances':
+                                exchange_for_slot = exch or user.exchange
+                                try:
+                                    async with self._rest_slot(exchange_for_slot) as got:
+                                        if got:
+                                            await asyncio.to_thread(self.db.update_balances, user)
+                                            asyncio.create_task(_notify_api_balance())
+                                            try:
+                                                self._last_fetch_ts[(user.name, 'balances')] = datetime.now().timestamp()
+                                            except Exception:
+                                                pass
+                                            try:
+                                                self._write_fetch_summary()
+                                            except Exception:
+                                                pass
+                                        else:
+                                            try:
+                                                _human_log('PBData', f"[poll] Skipped balances update for {user.name}; rest slot busy for {exchange_for_slot}", level=self._rest_slot_busy_log_level)
+                                            except Exception:
+                                                pass
+                                            had_rate_limit = True
+                                except Exception as e:
+                                    try:
+                                        msg = str(e).lower()
+                                        if 'invalid request' in msg and 'recv_window' in msg:
+                                                tb = traceback.format_exc()
+                                                try:
+                                                    parsed = self._parse_recv_window_from_exception(e)
+                                                except Exception:
+                                                    parsed = {}
+                                                try:
+                                                    meta = {'traceback': tb} if tb else {}
+                                                    if parsed:
+                                                        meta.update(parsed)
+                                                    if not meta:
+                                                        meta = None
+                                                    _human_log('PBData', f"[poll] InvalidNonce / recv_window error for {user.name} ({user.exchange}): {e}", level='WARNING', meta=meta)
+                                                except Exception:
+                                                    pass
+                                                try:
+                                                    dur = None
+                                                    if parsed and parsed.get('delta_ms') is not None:
+                                                        delta_s = int(abs(int(parsed.get('delta_ms'))) / 1000)
+                                                        dur = min(max(60, delta_s + 10), 600)
+                                                    self._set_exchange_backoff(user.exchange, reason='invalid_nonce', duration=dur or 60, user=user)
+                                                except Exception:
+                                                    pass
+                                                had_rate_limit = True
+                                                continue
+                                    except Exception:
+                                        pass
+                            # (duplicate branches removed)
+                        except Exception as e:
+                            msg = str(e)
+                            tb = traceback.format_exc()
+                            try:
+                                _human_log('PBData', f"[poll] Shared {kind} poll failed for {user.name}: {e}", level='ERROR', meta={'traceback': tb})
+                            except Exception:
+                                pass
+                            _err_exch2 = getattr(user, 'exchange', None) or exch or 'unknown'
+                            try:
+                                self._poller_metrics[_err_exch2]['errors'] += 1
+                            except Exception:
+                                pass
+                            lower = msg.lower()
+                            if '429' in lower or 'too many requests' in lower or 'rate limit' in lower:
+                                had_rate_limit = True
+                                try:
+                                    self._poller_metrics[_err_exch2]['rate_limit_429'] += 1
+                                except Exception:
+                                    pass
+                        else:
+                            _serial_users_polled += 1
+                        # Small stagger between per-user REST requests to avoid bursts
+                        # Skip for exchanges with budget tracking (budget handles pacing)
+                        _has_budget2 = (exch or getattr(user, 'exchange', None) or '') in self._rate_budgets
+                        if not _has_budget2:
+                            try:
+                                pause_val = self._shared_rest_pause_by_exchange.get(exch, self._shared_rest_user_pause)
+                                if pause_val and pause_val > 0:
+                                    jitter = random.uniform(0, pause_val * 0.2)
+                                    await asyncio.sleep(pause_val + jitter)
+                            except Exception:
+                                pass
+                finally:
+                    if _bpl2:
+                        _bpl2.release()
+            # Record per-exchange history/serial-poller metrics
+            if kind == 'history':
+                _serial_cycle_end = datetime.now().timestamp()
+                _serial_exch = exchange_filter or 'all'
+                try:
+                    m = self._poller_metrics[_serial_exch]
+                    m['history_last_ts'] = _serial_cycle_end
+                    m['history_cycle_ms'] = int((_serial_cycle_end - _serial_cycle_start) * 1000)
+                    m['history_users'] = _serial_users_polled
+                except Exception:
+                    pass
             if had_rate_limit:
-                backoff = min(max_backoff, backoff + 30)
+                # Skip backoff escalation for exchanges with budget tracking
+                if exchange_filter and exchange_filter in self._rate_budgets:
+                    pass
+                else:
+                    backoff = min(max_backoff, backoff + 30)
             else:
                 if backoff:
                     _human_log('PBData', f"[poll] Shared {kind} poll recovered; resetting backoff", level='INFO')
                 backoff = 0
 
-    async def _shared_combined_poll_serial(self, interval_seconds: int = 60, per_exchange: bool = True):
+    async def _shared_combined_poll_serial(self, interval_seconds: int = 60, per_exchange: bool = True, exchange_filter: str = None):
         """Shared poller that sequentially runs balances, positions and orders per user.
 
         This ensures only one REST "connection" worth of work is performed at a time
         for these combined kinds (per exchange), reducing parallel HTTP load.
         History polling remains separate because it can be long-running.
+        If `exchange_filter` is set, only users of that specific exchange are polled.
         """
         backoff = 0
         max_backoff = 600
         base_interval = max(10, interval_seconds)
-        _human_log('PBData', f"[poll] Starting shared COMBINED poller interval={base_interval}s", level='INFO')
+        exch_label = f" exchange={exchange_filter}" if exchange_filter else ""
+        _human_log('PBData', f"[poll] Starting shared COMBINED poller interval={base_interval}s{exch_label}", level='INFO')
+        # Persistent Exchange instances per user — keeps CCXT's markets cache alive
+        # across poll cycles so load_markets() is only called once (not once per cycle).
+        _user_exch: dict = {}
         while True:
             delay = base_interval + backoff
             await asyncio.sleep(delay)
             users = [u for u in self.users if u.name in self.fetch_users]
+            if exchange_filter:
+                users = [u for u in users if u.exchange == exchange_filter]
             if not users:
                 continue
             if per_exchange:
@@ -3372,65 +2831,216 @@ class PBData():
             else:
                 batches = [(None, users)]
             had_rate_limit = False
+            _combined_cycle_start = datetime.now().timestamp()
+            _combined_users_polled = 0
+            # Remove persistent instances for users no longer active
+            _active_names = {u.name for u in users}
+            for _stale_name in [n for n in list(_user_exch) if n not in _active_names]:
+                try:
+                    _user_exch.pop(_stale_name).close()
+                except Exception:
+                    pass
             for exch, batch_users in batches:
-                if exch and self._is_exchange_in_backoff(exch):
+                if exch and exch not in self._rate_budgets and self._is_exchange_in_backoff(exch):
                     _human_log('PBData', f"[poll] Skipping shared COMBINED poll for {exch} due to backoff")
                     continue
-                for user in batch_users:
-                    try:
-                        exchange_for_slot = exch or getattr(user, 'exchange', None) or 'unknown'
-                        async with self._rest_slot(exchange_for_slot) as got:
-                            if not got:
-                                _human_log('PBData', f"[poll] Shared COMBINED poll skipped {user.name}: REST slot timed out", level='DEBUG', user=user.name)
-                                continue
-                            # balances -> positions -> orders (sequential)
-                            # Skip each part if a WS watcher exists for that kind
-                            ws_bal = self._balance_ws_tasks.get(user.name)
-                            if not (ws_bal and not ws_bal.done()):
-                                await asyncio.to_thread(self.db.update_balances, user)
-                                asyncio.create_task(_notify_api_balance())
+                exchange_rate_limited = False
+                # Acquire per-exchange budget lock so combined/history don't starve each other.
+                _bpl = self._budget_poller_locks.get(exch)
+                if _bpl:
+                    await _bpl.acquire()
+                try:
+                    for user in batch_users:
+                        if exchange_rate_limited:
+                            break
+                        try:
+                            exchange_for_slot = exch or getattr(user, 'exchange', None) or 'unknown'
+                            async with self._rest_slot(exchange_for_slot) as got:
+                                if not got:
+                                    _human_log('PBData', f"[poll] Shared COMBINED poll skipped {user.name}: REST slot timed out", level='DEBUG', user=user.name)
+                                    try:
+                                        self._poller_metrics[exchange_for_slot]['rest_slot_timeouts'] += 1
+                                    except Exception:
+                                        pass
+                                    continue
+                                # ── Balance: skip if timer not due AND user not stale ──
+                                _balance_due = True
                                 try:
-                                    self._last_fetch_ts[(user.name, 'balances')] = datetime.now().timestamp()
+                                    _last_bal = self._last_fetch_ts.get((user.name, 'balances'))
+                                    if _last_bal is not None:
+                                        _bal_age = datetime.now().timestamp() - _last_bal
+                                        _bal_interval = getattr(self, '_poll_interval_balance_seconds', 300)
+                                        _is_stale = user.name in getattr(self, '_balance_stale_users', set())
+                                        if _bal_age < _bal_interval and not _is_stale:
+                                            _balance_due = False
                                 except Exception:
                                     pass
-                            ws_pos = self._position_ws_tasks.get(user.name)
-                            if not (ws_pos and not ws_pos.done()):
-                                await asyncio.to_thread(self.db.update_positions, user)
+                                # ── Positions: skip if timer not due AND user not stale ──
+                                _positions_due = True
                                 try:
-                                    self._last_fetch_ts[(user.name, 'positions')] = datetime.now().timestamp()
+                                    _last_pos = self._last_fetch_ts.get((user.name, 'positions'))
+                                    if _last_pos is not None:
+                                        _pos_age = datetime.now().timestamp() - _last_pos
+                                        _pos_interval = getattr(self, '_poll_interval_positions_seconds', 300)
+                                        _is_pos_stale = user.name in getattr(self, '_positions_stale_users', set())
+                                        if _pos_age < _pos_interval and not _is_pos_stale:
+                                            _positions_due = False
                                 except Exception:
                                     pass
-                            ws_ord = self._order_ws_tasks.get(user.name)
-                            if not (ws_ord and not ws_ord.done()):
-                                await asyncio.to_thread(self.db.update_orders, user)
+                                # ── Orders: skip if timer not due AND user not stale ──
+                                _orders_due = True
                                 try:
-                                    self._last_fetch_ts[(user.name, 'orders')] = datetime.now().timestamp()
+                                    _last_ord = self._last_fetch_ts.get((user.name, 'orders'))
+                                    if _last_ord is not None:
+                                        _ord_age = datetime.now().timestamp() - _last_ord
+                                        _ord_interval = getattr(self, '_poll_interval_orders_seconds', 60)
+                                        _is_ord_stale = user.name in getattr(self, '_orders_stale_users', set())
+                                        if _ord_age < _ord_interval and not _is_ord_stale:
+                                            _orders_due = False
                                 except Exception:
                                     pass
+                                # Nothing to do for this user
+                                if not _balance_due and not _positions_due and not _orders_due:
+                                    _combined_users_polled += 1
+                                    try:
+                                        self._write_fetch_summary()
+                                    except Exception:
+                                        pass
+                                    continue
+                                # ── Persistent shared Exchange ──
+                                # Reuse the same Exchange instance across poll cycles so that
+                                # CCXT's markets cache (self.instance.markets) is not discarded
+                                # between cycles.  On Hyperliquid, fetch_positions() calls
+                                # load_markets() internally; with a fresh instance that means
+                                # 3-4 extra REST calls per user per cycle → 429s.  With a
+                                # persistent instance the cache hit skips those calls entirely.
+                                _n_due = int(_balance_due) + int(_positions_due) + int(_orders_due)
+                                if user.name not in _user_exch:
+                                    _user_exch[user.name] = _Exchange(user.exchange, user)
+                                _shared_exch = _user_exch[user.name]
+                                try:
+                                    if _balance_due:
+                                        if not await self._acquire_rate_budget(exchange_for_slot, 'fetch_balance'):
+                                            continue
+                                        await asyncio.to_thread(self.db.update_balances, user, _shared_exch)
+                                        asyncio.create_task(_notify_api_balance())
+                                        try:
+                                            self._last_fetch_ts[(user.name, 'balances')] = datetime.now().timestamp()
+                                        except Exception:
+                                            pass
+                                        try:
+                                            self._balance_stale_users.discard(user.name)
+                                        except Exception:
+                                            pass
+                                    if _positions_due:
+                                        if not await self._acquire_rate_budget(exchange_for_slot, 'fetch_positions'):
+                                            continue
+                                        await asyncio.to_thread(self.db.update_positions, user, _shared_exch)
+                                        try:
+                                            self._last_fetch_ts[(user.name, 'positions')] = datetime.now().timestamp()
+                                        except Exception:
+                                            pass
+                                        try:
+                                            self._positions_stale_users.discard(user.name)
+                                        except Exception:
+                                            pass
+                                        # Positions changed → orders probably changed too
+                                        try:
+                                            self._orders_stale_users.add(user.name)
+                                        except Exception:
+                                            pass
+                                    if not _orders_due:
+                                        _combined_users_polled += 1
+                                        try:
+                                            self._write_fetch_summary()
+                                        except Exception:
+                                            pass
+                                        continue
+                                    # Dynamic weight: fetch_open_orders is called once PER position
+                                    _n_pos = 1
+                                    try:
+                                        _pos_rows = self.db.fetch_positions(user)
+                                        if _pos_rows:
+                                            _n_pos = max(1, len(_pos_rows))
+                                    except Exception:
+                                        pass
+                                    _orders_weight = get_weight(exchange_for_slot, 'fetch_open_orders') * _n_pos
+                                    if not await self._acquire_rate_budget(exchange_for_slot, 'fetch_open_orders', weight_override=_orders_weight):
+                                        continue
+                                    await asyncio.to_thread(self.db.update_orders, user, _shared_exch)
+                                    try:
+                                        self._last_fetch_ts[(user.name, 'orders')] = datetime.now().timestamp()
+                                    except Exception:
+                                        pass
+                                    try:
+                                        self._orders_stale_users.discard(user.name)
+                                    except Exception:
+                                        pass
+                                    _combined_users_polled += 1
+                                    try:
+                                        self._write_fetch_summary()
+                                    except Exception:
+                                        pass
+                                finally:
+                                    # Do NOT close _shared_exch here — we keep it alive
+                                    # so CCXT's markets cache survives to the next cycle.
+                                    pass
+                        except Exception as e:
+                            msg = str(e)
+                            tb = traceback.format_exc()
                             try:
-                                self._write_fetch_summary()
+                                _human_log('PBData', f"[poll] Shared COMBINED poll failed for {user.name}: {e}", level='ERROR', meta={'traceback': tb})
                             except Exception:
                                 pass
-                    except Exception as e:
-                        msg = str(e)
-                        tb = traceback.format_exc()
-                        try:
-                            _human_log('PBData', f"[poll] Shared COMBINED poll failed for {user.name}: {e}", level='ERROR', meta={'traceback': tb})
-                        except Exception:
-                            pass
-                        lower = msg.lower()
-                        if '429' in lower or 'too many requests' in lower or 'rate limit' in lower:
-                            had_rate_limit = True
-                    # Small stagger between per-user REST requests to avoid bursts
-                    try:
-                        pause_val = self._shared_rest_pause_by_exchange.get(exch, self._shared_rest_user_pause)
-                        if pause_val and pause_val > 0:
-                            jitter = random.uniform(0, pause_val * 0.2)
-                            await asyncio.sleep(pause_val + jitter)
-                    except Exception:
-                        pass
+                            _err_exch = getattr(user, 'exchange', None) or exch or 'unknown'
+                            try:
+                                self._poller_metrics[_err_exch]['errors'] += 1
+                            except Exception:
+                                pass
+                            lower = msg.lower()
+                            if '429' in lower or 'too many requests' in lower or 'rate limit' in lower:
+                                had_rate_limit = True
+                                exchange_rate_limited = True
+                                try:
+                                    self._poller_metrics[_err_exch]['rate_limit_429'] += 1
+                                except Exception:
+                                    pass
+                                # Skip backoff for exchanges with budget tracking (budget handles pacing)
+                                if _err_exch not in self._rate_budgets:
+                                    try:
+                                        self._set_exchange_backoff(user.exchange, reason='rate_limit_429', duration=45, user=user)
+                                    except Exception:
+                                        pass
+                        if not exchange_rate_limited:
+                            # Skip fixed pause for exchanges with budget tracking (budget handles pacing)
+                            _has_budget = (exch or getattr(user, 'exchange', None) or '') in self._rate_budgets
+                            if not _has_budget:
+                                try:
+                                    pause_val = self._shared_rest_pause_by_exchange.get(exch, self._shared_rest_user_pause)
+                                    if pause_val and pause_val > 0:
+                                        jitter = random.uniform(0, pause_val * 0.2)
+                                        await asyncio.sleep(pause_val + jitter)
+                                except Exception:
+                                    pass
+                finally:
+                    if _bpl:
+                        _bpl.release()
+            # Record per-exchange combined-poller metrics
+            _combined_cycle_end = datetime.now().timestamp()
+            _combined_exch = exchange_filter or 'all'
+            try:
+                m = self._poller_metrics[_combined_exch]
+                m['combined_last_ts'] = _combined_cycle_end
+                m['combined_cycle_ms'] = int((_combined_cycle_end - _combined_cycle_start) * 1000)
+                m['combined_users'] = _combined_users_polled
+            except Exception:
+                pass
             if had_rate_limit:
-                backoff = min(max_backoff, backoff + 30)
+                # Skip backoff escalation for exchanges with budget tracking
+                if exchange_filter and exchange_filter in self._rate_budgets:
+                    pass
+                else:
+                    backoff = min(max_backoff, backoff + 30)
             else:
                 if backoff:
                     _human_log('PBData', f"[poll] Shared COMBINED poll recovered; resetting backoff")
@@ -3933,6 +3543,17 @@ class PBData():
                     self._shared_history_tasks_by_exchange = {}
                 except Exception:
                     pass
+                # Also cancel per-exchange combined tasks so new interval takes effect.
+                for _exch, _t in list(getattr(self, '_shared_combined_tasks_by_exchange', {}).items()):
+                    try:
+                        if _t and not _t.done():
+                            _t.cancel()
+                    except Exception:
+                        pass
+                try:
+                    self._shared_combined_tasks_by_exchange = {}
+                except Exception:
+                    pass
                 self._poll_intervals_changed = False
         except Exception:
             pass
@@ -3955,14 +3576,6 @@ class PBData():
             if user.name in self.fetch_users:
                 users_by_exchange[user.exchange].append(user)
 
-        # Determine desired watcher set directly from configured fetch users
-        desired_user_names = set(self.fetch_users)
-
-        # Stop watchers for users no longer configured
-        await self._reconcile_balance_watchers(desired_user_names)
-        await self._reconcile_position_watchers(desired_user_names)
-        await self._reconcile_order_watchers(desired_user_names)
-
         for exchange, users in users_by_exchange.items():
             # Log only when count changes for this exchange or periodically
             count = len(users)
@@ -3971,43 +3584,35 @@ class PBData():
                 _human_log('PBData', f"[async] Queueing {count} user(s) for exchange: {exchange}", level='INFO')
                 self._last_exchange_queue_counts[exchange] = count
 
-        # Phase websocket watcher startup per user to avoid bursts:
-        #   - Phase 1: balance + positions
-        #   - Phase 2: orders
-        phase1_users = []
-        phase2_users = []
-        for uname in self.fetch_users:
-            u = self.users.find_user(uname)
-            if not u:
-                continue
-            phase1_users.append(u)
-            phase2_users.append(u)
-
-        # Phase 1: start balance and positions watchers
-        for u in phase1_users:
-            await self._ensure_balance_watcher(u)
-            await self._ensure_position_watcher(u)
-            # Small stagger to avoid starting many watchers at once
-            await asyncio.sleep(self._private_ws_stagger_ms / 1000.0)
-
-        # Phase 2: start orders watchers
-        for u in phase2_users:
-            await self._ensure_order_watcher(u)
-            # Small stagger to avoid bursts of order watchers
-            await asyncio.sleep(self._private_ws_stagger_ms / 1000.0)
-
         # Start shared serial pollers only after a grace period so that
         # websocket startup and initial subscriptions don't coincide with
         # heavy REST history/position/order/balance traffic.
         now_ts = datetime.now().timestamp()
         if now_ts >= self._pollers_enabled_after_ts:
             try:
-                # Start a combined poller that sequentially runs balances, positions
-                # and orders to avoid parallel REST connections, plus a separate
-                # history poller (history can be long-running and is kept separate).
-                if not hasattr(self, "_shared_combined_task") or self._shared_combined_task is None or self._shared_combined_task.done():
-                    # Use a slightly longer interval for the combined poller to reduce REST load
-                    self._shared_combined_task = asyncio.create_task(self._shared_combined_poll_serial(self._shared_combined_interval_seconds, per_exchange=True))
+                # Per-exchange combined pollers: one task per exchange so that slow or
+                # rate-limited exchanges (e.g. hyperliquid) don't block fast ones (e.g. binance).
+                if not hasattr(self, "_shared_combined_tasks_by_exchange"):
+                    self._shared_combined_tasks_by_exchange = {}
+                # Determine the set of exchanges currently in fetch_users.
+                _comb_exchanges = set()
+                for _uname in self.fetch_users:
+                    _u = self.users.find_user(_uname)
+                    if _u and getattr(_u, 'exchange', None):
+                        _comb_exchanges.add(_u.exchange)
+                for _exch in _comb_exchanges:
+                    _t = self._shared_combined_tasks_by_exchange.get(_exch)
+                    if _t is None or _t.done():
+                        self._shared_combined_tasks_by_exchange[_exch] = asyncio.create_task(
+                            self._shared_combined_poll_serial(
+                                self._shared_combined_interval_seconds,
+                                per_exchange=False,
+                                exchange_filter=_exch,
+                            )
+                        )
+                # Legacy single-task attribute: keep for backwards compat (e.g. interval-change restart).
+                if not hasattr(self, "_shared_combined_task") or self._shared_combined_task is None:
+                    self._shared_combined_task = asyncio.create_task(asyncio.sleep(0))
                 # Per-exchange history pollers: one task per exchange so that slow
                 # exchanges (e.g. hyperliquid) don't block fast ones (e.g. binance).
                 if not hasattr(self, "_shared_history_tasks_by_exchange"):
@@ -4092,18 +3697,9 @@ class PBData():
                 if u.name not in self.fetch_users:
                     continue
                 all_users.append(u.name)
-                if self._balance_ws_tasks.get(u.name) and not self._balance_ws_tasks.get(u.name).done():
-                    balances_ws.append(u.name)
-                else:
-                    balances_rest.append(u.name)
-                if self._position_ws_tasks.get(u.name) and not self._position_ws_tasks.get(u.name).done():
-                    positions_ws.append(u.name)
-                else:
-                    positions_rest.append(u.name)
-                if self._order_ws_tasks.get(u.name) and not self._order_ws_tasks.get(u.name).done():
-                    orders_ws.append(u.name)
-                else:
-                    orders_rest.append(u.name)
+                balances_rest.append(u.name)
+                positions_rest.append(u.name)
+                orders_rest.append(u.name)
 
             # Include last-fetch (minutes ago) per user/kind where available
             now_ts = datetime.now().timestamp()
@@ -4189,11 +3785,19 @@ class PBData():
                             }
                     except Exception:
                         pass
+                    # Build price watcher info per exchange
+                    prices_info = {}
+                    for exch_name, task in list(self._price_exchange_tasks.items()):
+                        cfg = self._price_exchange_config.get(exch_name, {})
+                        sym_count = len(cfg.get('symbols', set()))
+                        active = bool(task and not task.done())
+                        prices_info[exch_name] = {'symbols': sym_count, 'active': active}
                     summary_obj = {
                         'timestamp': datetime.now().isoformat(sep=' ', timespec='seconds'),
                         'balances': {'ws': balances_ws, 'rest': balances_rest},
                         'positions': {'ws': positions_ws, 'rest': positions_rest},
                         'orders': {'ws': orders_ws, 'rest': orders_rest},
+                        'prices': prices_info,
                         'history': all_users,
                         'executions': exec_users,
                         'last_fetch_ts': lf,
@@ -4228,6 +3832,86 @@ class PBData():
             except Exception:
                 pass
 
+    def _write_poller_metrics(self):
+        """Write poller_metrics.json for the GUI metrics panel.
+
+        Collects per-exchange counters from _poller_metrics dict, backoff states,
+        semaphore stats, and market-data status. Safe to call from _metrics_loop.
+        """
+        try:
+            now = datetime.now().timestamp()
+            # Per-exchange poller counters
+            exchanges = {}
+            for exch, m in dict(self._poller_metrics).items():
+                exchanges[exch] = dict(m)
+                # Inject current backoff status
+                bo_until = self._exchange_backoff_until.get(exch, 0)
+                hbo_until = self._exchange_history_backoff_until.get(exch, 0)
+                exchanges[exch]['backoff_remaining_s'] = max(0, int(bo_until - now)) if bo_until > now else 0
+                exchanges[exch]['history_backoff_remaining_s'] = max(0, int(hbo_until - now)) if hbo_until > now else 0
+
+            # REST semaphore stats
+            semaphores = {}
+            for exch, sem in dict(self._rest_semaphores).items():
+                limit = self._rest_semaphore_limits_by_exchange.get(exch, self._default_rest_semaphore_limit)
+                try:
+                    available = sem._value  # asyncio.Semaphore internal counter
+                except Exception:
+                    available = -1
+                semaphores[exch] = {
+                    'slots': limit,
+                    'available': available,
+                    'in_use': max(0, limit - available) if available >= 0 else 0,
+                }
+
+            # Market data status (read existing file)
+            market_data = {}
+            try:
+                if self._market_data_status_path.exists():
+                    md = json.loads(self._market_data_status_path.read_text(encoding='utf-8'))
+                    for key in ('latest_1m', 'binance_latest_1m', 'bybit_latest_1m'):
+                        if key in md:
+                            entry = md[key]
+                            market_data[key] = {
+                                'exchange': entry.get('exchange', ''),
+                                'running': entry.get('running', False),
+                                'coins_done': entry.get('coins_done', 0),
+                                'coins_total': entry.get('coins_total', 0),
+                                'last_run_ts': entry.get('last_run_ts', 0),
+                                'current_coin': entry.get('current_coin'),
+                            }
+            except Exception:
+                pass
+
+            # Rate-limit budgets
+            budgets = {}
+            for exch_name, budget in self._rate_budgets.items():
+                try:
+                    budgets[exch_name] = budget.peek()
+                except Exception:
+                    pass
+
+            obj = {
+                'timestamp': datetime.now().isoformat(sep=' ', timespec='seconds'),
+                'exchanges': exchanges,
+                'semaphores': semaphores,
+                'market_data': market_data,
+                'budgets': budgets,
+            }
+            logs_dir = _Path(f"{PBGDIR}/data/logs")
+            if not logs_dir.exists():
+                try:
+                    logs_dir.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
+            try:
+                with open(logs_dir / 'poller_metrics.json', 'w') as _f:
+                    json.dump(obj, _f, indent=2, ensure_ascii=False)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def _write_fetch_summary(self):
         """Write machine-readable `fetch_summary.json` from current in-memory state.
 
@@ -4254,18 +3938,9 @@ class PBData():
                 if u.name not in self.fetch_users:
                     continue
                 all_users.append(u.name)
-                if self._balance_ws_tasks.get(u.name) and not self._balance_ws_tasks.get(u.name).done():
-                    balances_ws.append(u.name)
-                else:
-                    balances_rest.append(u.name)
-                if self._position_ws_tasks.get(u.name) and not self._position_ws_tasks.get(u.name).done():
-                    positions_ws.append(u.name)
-                else:
-                    positions_rest.append(u.name)
-                if self._order_ws_tasks.get(u.name) and not self._order_ws_tasks.get(u.name).done():
-                    orders_ws.append(u.name)
-                else:
-                    orders_rest.append(u.name)
+                balances_rest.append(u.name)
+                positions_rest.append(u.name)
+                orders_rest.append(u.name)
 
             # Executions polling is only meaningful for a subset of exchanges.
             # Keep in sync with Database.update_executions() support.
@@ -4303,11 +3978,32 @@ class PBData():
                     'executions': self._last_fetch_ts.get((u, 'executions')),
                 }
 
+            # Build price watcher info per exchange
+            prices_info = {}
+            for exch_name, task in list(self._price_exchange_tasks.items()):
+                cfg = self._price_exchange_config.get(exch_name, {})
+                sym_count = len(cfg.get('symbols', set()))
+                active = bool(task and not task.done())
+                # Collect unique user-facing (internal) symbols from the mapping
+                user_syms: list = []
+                try:
+                    mapping = cfg.get('mapping', {})
+                    seen_syms: set = set()
+                    for pairs in mapping.values():
+                        for _uname, internal_sym in pairs:
+                            if internal_sym not in seen_syms:
+                                seen_syms.add(internal_sym)
+                                user_syms.append(internal_sym)
+                    user_syms.sort()
+                except Exception:
+                    user_syms = []
+                prices_info[exch_name] = {'symbols': sym_count, 'active': active, 'symbol_list': user_syms}
             summary_obj = {
                 'timestamp': datetime.now().isoformat(sep=' ', timespec='seconds'),
                 'balances': {'ws': balances_ws, 'rest': balances_rest},
                 'positions': {'ws': positions_ws, 'rest': positions_rest},
                 'orders': {'ws': orders_ws, 'rest': orders_rest},
+                'prices': prices_info,
                 'history': all_users,
                 'executions': exec_users,
                 'last_fetch_ts': lf,
